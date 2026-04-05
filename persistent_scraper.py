@@ -249,14 +249,11 @@ class PersistentPocket48Scraper:
             return {'messages': [], 'next_time': next_time}
 
     def save_messages(self, messages: List[Dict[str, Any]], room_id: str) -> int:
-        saved_count = 0
-        for msg in messages:
-            try:
-                if self.storage.save_message(msg):
-                    saved_count += 1
-            except Exception as exc:
-                logger.error('保存消息失败: %s', exc)
-        return saved_count
+        try:
+            return self.storage.save_messages(messages)
+        except Exception as exc:
+            logger.error('保存消息失败: %s', exc)
+            return 0
 
     def _get_latest_local_message(self, room_id: str) -> Optional[Dict[str, Any]]:
         return self.storage.get_latest_message(room_id)

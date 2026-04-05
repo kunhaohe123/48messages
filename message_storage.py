@@ -107,6 +107,13 @@ class MessageStorage(ABC):
     def save_message(self, message: Dict[str, Any]) -> bool:
         pass
 
+    def save_messages(self, messages: List[Dict[str, Any]]) -> int:
+        saved_count = 0
+        for message in messages:
+            if self.save_message(message):
+                saved_count += 1
+        return saved_count
+
     @abstractmethod
     def get_messages(self, room_id: str, limit: int = 100) -> List[Dict[str, Any]]:
         pass
@@ -199,6 +206,35 @@ class SQLiteStorage(MessageStorage):
         except Exception as exc:
             logger.error('保存消息失败: %s', exc)
             return False
+
+    def save_messages(self, messages: List[Dict[str, Any]]) -> int:
+        if not messages:
+            return 0
+
+        try:
+            conn = self._connect()
+            cursor = conn.cursor()
+            cursor.executemany("""
+                INSERT OR IGNORE INTO messages
+                (room_id, message_id, user_id, username, content, msg_type, ext_info, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, [(
+                message.get('room_id'),
+                message.get('message_id'),
+                message.get('user_id'),
+                message.get('username'),
+                _json_dumps(message.get('content')),
+                str(message.get('msg_type') or ''),
+                _json_dumps(message.get('ext_info')),
+                message.get('timestamp'),
+            ) for message in messages])
+            conn.commit()
+            affected = cursor.rowcount
+            conn.close()
+            return max(affected, 0)
+        except Exception as exc:
+            logger.error('批量保存消息失败: %s', exc)
+            return 0
 
     def get_messages(self, room_id: str, limit: int = 100) -> List[Dict[str, Any]]:
         conn = self._connect()
@@ -420,6 +456,118 @@ class MySQLStorage(MessageStorage):
 
             conn.commit()
             return inserted > 0
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def save_messages(self, messages: List[Dict[str, Any]]) -> int:
+        if not messages:
+            return 0
+
+        first_message = messages[0]
+        owner_member_id = first_message.get('owner_member_id')
+        room_id = first_message.get('room_id')
+        if owner_member_id is None or room_id is None:
+            raise ValueError('消息缺少 owner_member_id 或 room_id，无法写入 MySQL')
+
+        conn = self._connect()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO members (id, member_name, room_id)
+                    VALUES (%s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        member_name = VALUES(member_name),
+                        room_id = VALUES(room_id),
+                        updated_at = CURRENT_TIMESTAMP
+                """, (
+                    owner_member_id,
+                    first_message.get('member_name') or first_message.get('username') or str(owner_member_id),
+                    room_id,
+                ))
+                cursor.execute("""
+                    INSERT INTO rooms (id, owner_member_id, room_name)
+                    VALUES (%s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        owner_member_id = VALUES(owner_member_id),
+                        room_name = VALUES(room_name),
+                        updated_at = CURRENT_TIMESTAMP
+                """, (
+                    room_id,
+                    owner_member_id,
+                    first_message.get('member_name') or str(room_id),
+                ))
+
+                message_rows = []
+                payload_rows = []
+                for message in messages:
+                    message_id = str(message.get('message_id') or '')
+                    message_rows.append((
+                        message_id,
+                        message.get('room_id'),
+                        message.get('user_id'),
+                        message.get('username'),
+                        message.get('owner_member_id'),
+                        str(message.get('msg_type') or 'UNKNOWN'),
+                        message.get('sub_type'),
+                        _extract_text_content(message.get('content'), message.get('ext_info')),
+                        _timestamp_ms_to_datetime(message.get('timestamp')),
+                        message.get('timestamp'),
+                        0,
+                        _json_dumps({
+                            'body': _parse_json_like(message.get('content')),
+                            'extInfo': _parse_json_like(message.get('ext_info')),
+                        }),
+                    ))
+                    payload = _extract_media_fields(message.get('content'), message.get('ext_info'))
+                    payload_rows.append((
+                        message_id,
+                        payload['media_url'],
+                        None,
+                        payload['media_cover_url'],
+                        payload['media_duration'],
+                        payload['width'],
+                        payload['height'],
+                        None,
+                        payload['reply_to_text'],
+                        payload['flip_user_name'],
+                        payload['flip_question'],
+                        payload['flip_answer'],
+                        payload['ext_json'],
+                    ))
+
+                cursor.executemany("""
+                    INSERT IGNORE INTO messages (
+                        message_id, room_id, sender_user_id, sender_name, owner_member_id,
+                        message_type, sub_type, text_content, message_time, message_time_ms,
+                        is_deleted, raw_brief
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, message_rows)
+                saved_count = max(cursor.rowcount, 0)
+
+                cursor.executemany("""
+                    INSERT INTO message_payloads (
+                        message_id, media_url, media_path, media_cover_url, media_duration,
+                        width, height, reply_to_message_id, reply_to_text,
+                        flip_user_name, flip_question, flip_answer, ext_json
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        media_url = VALUES(media_url),
+                        media_cover_url = VALUES(media_cover_url),
+                        media_duration = VALUES(media_duration),
+                        width = VALUES(width),
+                        height = VALUES(height),
+                        reply_to_text = VALUES(reply_to_text),
+                        flip_user_name = VALUES(flip_user_name),
+                        flip_question = VALUES(flip_question),
+                        flip_answer = VALUES(flip_answer),
+                        ext_json = VALUES(ext_json)
+                """, payload_rows)
+
+            conn.commit()
+            return saved_count
         except Exception:
             conn.rollback()
             raise

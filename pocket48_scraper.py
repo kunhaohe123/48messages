@@ -8,6 +8,7 @@
 import json
 import time
 import logging
+import threading
 from typing import Any, Dict, List, Optional
 from pathlib import Path
 
@@ -256,11 +257,7 @@ class Pocket48Client:
             return {'messages': [], 'next_time': next_time}
 
     def save_messages(self, messages: List[Dict[str, Any]]) -> int:
-        saved_count = 0
-        for msg in messages:
-            if self.storage.save_message(msg):
-                saved_count += 1
-        return saved_count
+        return self.storage.save_messages(messages)
 
     def _get_latest_local_message(self, room_id: str) -> Optional[Dict[str, Any]]:
         return self.storage.get_latest_message(room_id)
@@ -286,7 +283,8 @@ class Pocket48Client:
 
     def monitor_room(self, member: Dict[str, Any], interval: int = 60, limit: int = 100):
         room_id = str(member.get('channelId'))
-        logger.info("开始监控房间 %s，间隔 %s 秒", room_id, interval)
+        room_name = member.get('name', room_id)
+        logger.info("开始监控房间 %s(%s)，间隔 %s 秒", room_name, room_id, interval)
 
         first_fetch = True
         while True:
@@ -307,7 +305,7 @@ class Pocket48Client:
                         last_message_id=latest_message.get('message_id'),
                         last_message_time_ms=latest_message.get('timestamp'),
                     )
-                    logger.info("房间 %s 保存了 %s 条新消息", room_id, saved)
+                    logger.info("房间 %s(%s) 保存了 %s 条新消息", room_name, room_id, saved)
                 else:
                     self.storage.record_fetch(room_id=room_id, messages_count=0, status='success')
 
@@ -316,10 +314,10 @@ class Pocket48Client:
                 time.sleep(interval)
 
             except KeyboardInterrupt:
-                logger.info("停止监控")
+                logger.info("停止监控房间 %s(%s)", room_name, room_id)
                 break
             except Exception as exc:
-                logger.error("监控异常: %s", exc)
+                logger.error("监控异常 %s(%s): %s", room_name, room_id, exc)
                 self.storage.record_fetch(room_id=room_id, messages_count=0, status='failed', error_message=str(exc))
                 time.sleep(interval * 2)
 
@@ -330,13 +328,25 @@ class MessageScraper:
     def __init__(self, config_path: str = "config.json"):
         self.client = Pocket48Client(config_path)
         self.config = self.client.config
+        self.threads: List[threading.Thread] = []
 
-    def run(self):
+    def _select_members(self, member_names: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        members = self.config.get('members', [])
+        if not member_names:
+            return members
+
+        selected = [member for member in members if member.get('name') in set(member_names)]
+        missing_names = [name for name in member_names if name not in {member.get('name') for member in selected}]
+        for name in missing_names:
+            logger.warning("未找到成员配置: %s", name)
+        return selected
+
+    def run(self, member_names: Optional[List[str]] = None):
         if not self.client.login():
             logger.error("登录失败，程序退出")
             return
 
-        members = self.config.get('members', [])
+        members = self._select_members(member_names)
         monitor_config = self.config.get('monitor', {})
         if not members:
             logger.warning("没有配置监控成员")
@@ -345,9 +355,95 @@ class MessageScraper:
         logger.info("开始监控 %s 个成员", len(members))
         interval = monitor_config.get('interval', 60)
         limit = monitor_config.get('limit', 100)
+
         for member in members:
             if member.get('channelId') is not None and member.get('serverId') is not None:
-                self.client.monitor_room(member, interval=interval, limit=limit)
+                thread = threading.Thread(
+                    target=self.client.monitor_room,
+                    args=(member, interval, limit),
+                    daemon=True,
+                )
+                thread.start()
+                self.threads.append(thread)
+
+        logger.info("已启动 %s 个房间的监控", len(self.threads))
+
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("停止监控")
+
+    def _run_member_once(self, member: Dict[str, Any], fetch_limit: int, semaphore: Optional[threading.Semaphore] = None):
+        room_id = member.get('channelId')
+        server_id = member.get('serverId')
+        room_name = member.get('name', room_id)
+        if room_id is None or server_id is None:
+            logger.warning("跳过缺少 serverId/channelId 的成员配置: %s", member)
+            return
+
+        try:
+            if semaphore is not None:
+                semaphore.acquire()
+            result = self.client.get_room_messages(member, limit=fetch_limit, next_time=0)
+            messages = result['messages']
+            saved = self.client.save_messages(messages) if messages else 0
+
+            if messages:
+                latest_message = max(messages, key=lambda item: item.get('timestamp') or 0)
+                self.client.storage.record_fetch(
+                    room_id=str(room_id),
+                    messages_count=saved,
+                    status='success',
+                    last_message_id=latest_message.get('message_id'),
+                    last_message_time_ms=latest_message.get('timestamp'),
+                )
+            else:
+                self.client.storage.record_fetch(
+                    room_id=str(room_id),
+                    messages_count=0,
+                    status='success',
+                )
+
+            logger.info("单次抓取 %s(%s): 获取 %s 条，保存 %s 条", room_name, room_id, len(messages), saved)
+        except Exception as exc:
+            self.client.storage.record_fetch(
+                room_id=str(room_id),
+                messages_count=0,
+                status='failed',
+                error_message=str(exc),
+            )
+            logger.error("单次抓取异常 %s(%s): %s", room_name, room_id, exc)
+        finally:
+            if semaphore is not None:
+                semaphore.release()
+
+    def run_once(self, limit: Optional[int] = None, member_names: Optional[List[str]] = None,
+                 max_workers: Optional[int] = None):
+        if not self.client.login():
+            logger.error("登录失败，程序退出")
+            return
+
+        members = self._select_members(member_names)
+        monitor_config = self.config.get('monitor', {})
+        if not members:
+            logger.warning("没有配置监控成员")
+            return
+
+        fetch_limit = limit or monitor_config.get('limit', 100)
+        worker_count = max_workers or len(members)
+        worker_count = max(1, min(worker_count, len(members)))
+        logger.info("开始单次抓取 %s 个成员，并发 %s", len(members), worker_count)
+
+        threads: List[threading.Thread] = []
+        semaphore = threading.Semaphore(worker_count)
+        for member in members:
+            thread = threading.Thread(target=self._run_member_once, args=(member, fetch_limit, semaphore))
+            thread.start()
+            threads.append(thread)
+
+        for thread in threads:
+            thread.join()
 
     def export(self, output_path: str, output_format: str, room_id: Optional[str], limit: Optional[int]):
         count = self.client.storage.export_messages(
@@ -368,6 +464,9 @@ def main():
     parser.add_argument('--output', help='导出文件路径')
     parser.add_argument('--room-id', help='仅导出指定房间的消息')
     parser.add_argument('--limit', type=int, help='导出消息数量上限')
+    parser.add_argument('--once', action='store_true', help='每个成员只抓取一次后退出')
+    parser.add_argument('--member', action='append', help='仅抓取指定成员，可重复传入')
+    parser.add_argument('--workers', type=int, help='单次抓取时的最大并发成员数')
     args = parser.parse_args()
 
     try:
@@ -382,7 +481,10 @@ def main():
                 limit=args.limit,
             )
             return
-        scraper.run()
+        if args.once:
+            scraper.run_once(limit=args.limit, member_names=args.member, max_workers=args.workers)
+            return
+        scraper.run(member_names=args.member)
     except Exception as exc:
         logger.error("程序异常: %s", exc)
         raise
