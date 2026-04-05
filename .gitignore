@@ -4,3 +4,5 @@ token.json
 __pycache__/
 *.pyc
 .DS_Store
+messages_export.json
+db_connection_template.txt

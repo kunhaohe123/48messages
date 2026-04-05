@@ -8,13 +8,14 @@
 
 import json
 import time
-import sqlite3
 import logging
 import threading
 from typing import Any, Dict, List, Optional
 from pathlib import Path
 
 import requests
+
+from message_storage import MessageStorage, create_storage
 
 logging.basicConfig(
     level=logging.INFO,
@@ -127,43 +128,8 @@ class PersistentPocket48Scraper:
             raise RuntimeError('缺少有效 token')
         return {'token': token}
 
-    def _init_storage(self) -> sqlite3.Connection:
-        db_path = self.config.get('storage', {}).get('database', 'messages.db')
-        conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._create_tables(conn)
-        return conn
-
-    def _create_tables(self, conn: sqlite3.Connection):
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                room_id TEXT NOT NULL,
-                message_id TEXT UNIQUE,
-                user_id TEXT,
-                username TEXT,
-                content TEXT,
-                msg_type TEXT,
-                ext_info TEXT,
-                timestamp INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS fetch_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                room_id TEXT,
-                fetch_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                messages_count INTEGER,
-                status TEXT,
-                error_message TEXT
-            )
-        """)
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_room_time
-            ON messages(room_id, timestamp DESC)
-        """)
-        conn.commit()
+    def _init_storage(self) -> MessageStorage:
+        return create_storage(self.config)
 
     def _extract_user(self, ext_info: str) -> Dict[str, Any]:
         if not ext_info:
@@ -256,6 +222,8 @@ class PersistentPocket48Scraper:
                 user = self._extract_user(ext_info)
                 normalized.append({
                     'room_id': room_id,
+                    'owner_member_id': member.get('serverId'),
+                    'member_name': member.get('name', room_id),
                     'message_id': msg.get('msgIdServer') or msg.get('msgIdClient'),
                     'user_id': user.get('userId'),
                     'username': user.get('nickName'),
@@ -281,53 +249,17 @@ class PersistentPocket48Scraper:
             return {'messages': [], 'next_time': next_time}
 
     def save_messages(self, messages: List[Dict[str, Any]], room_id: str) -> int:
-        cursor = self.storage.cursor()
         saved_count = 0
-
         for msg in messages:
             try:
-                cursor.execute("""
-                    INSERT OR IGNORE INTO messages
-                    (room_id, message_id, user_id, username, content, msg_type, ext_info, timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    msg['room_id'],
-                    msg['message_id'],
-                    msg['user_id'],
-                    msg['username'],
-                    msg['content'],
-                    msg['msg_type'],
-                    msg['ext_info'],
-                    msg['timestamp'],
-                ))
-                if cursor.rowcount > 0:
+                if self.storage.save_message(msg):
                     saved_count += 1
             except Exception as exc:
                 logger.error('保存消息失败: %s', exc)
-
-        self.storage.commit()
-        cursor.execute("""
-            INSERT INTO fetch_logs (room_id, messages_count, status)
-            VALUES (?, ?, ?)
-        """, (room_id, saved_count, 'success'))
-        self.storage.commit()
         return saved_count
 
     def _get_latest_local_message(self, room_id: str) -> Optional[Dict[str, Any]]:
-        cursor = self.storage.cursor()
-        row = cursor.execute(
-            """
-            SELECT message_id, timestamp
-            FROM messages
-            WHERE room_id = ?
-            ORDER BY timestamp DESC
-            LIMIT 1
-            """,
-            (room_id,),
-        ).fetchone()
-        if not row:
-            return None
-        return {'message_id': row[0], 'timestamp': row[1]}
+        return self.storage.get_latest_message(room_id)
 
     def _filter_new_messages(self, room_id: str, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         latest_local = self._get_latest_local_message(room_id)
@@ -367,9 +299,18 @@ class PersistentPocket48Scraper:
 
                 if messages:
                     saved = self.save_messages(messages, room_id)
+                    latest_message = max(messages, key=lambda item: item.get('timestamp') or 0)
+                    self.storage.record_fetch(
+                        room_id=room_id,
+                        messages_count=saved,
+                        status='success',
+                        last_message_id=latest_message.get('message_id'),
+                        last_message_time_ms=latest_message.get('timestamp'),
+                    )
                     logger.info('房间 %s: 获取 %s 条，保存 %s 条新消息', room_id, len(messages), saved)
                     consecutive_errors = 0
                 else:
+                    self.storage.record_fetch(room_id=room_id, messages_count=0, status='success')
                     consecutive_errors = 0
 
                 first_fetch = False
@@ -385,6 +326,7 @@ class PersistentPocket48Scraper:
                 break
             except Exception as exc:
                 logger.error('监控异常: %s', exc)
+                self.storage.record_fetch(room_id=room_id, messages_count=0, status='failed', error_message=str(exc))
                 consecutive_errors += 1
                 time.sleep(interval)
 
@@ -430,31 +372,7 @@ class PersistentPocket48Scraper:
         logger.info('停止监控')
 
     def get_statistics(self) -> Dict[str, Any]:
-        cursor = self.storage.cursor()
-        cursor.execute('SELECT COUNT(*) FROM messages')
-        total_messages = cursor.fetchone()[0]
-
-        cursor.execute('SELECT COUNT(DISTINCT room_id) FROM messages')
-        total_rooms = cursor.fetchone()[0]
-
-        cursor.execute("SELECT COUNT(*) FROM fetch_logs WHERE status = 'success'")
-        successful_fetches = cursor.fetchone()[0]
-
-        cursor.execute("""
-            SELECT room_id, COUNT(*) as cnt
-            FROM messages
-            GROUP BY room_id
-            ORDER BY cnt DESC
-            LIMIT 10
-        """)
-        top_rooms = cursor.fetchall()
-
-        return {
-            'total_messages': total_messages,
-            'total_rooms': total_rooms,
-            'successful_fetches': successful_fetches,
-            'top_rooms': top_rooms,
-        }
+        return self.storage.get_statistics()
 
 
 def main():

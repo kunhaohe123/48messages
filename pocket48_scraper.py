@@ -1,195 +1,25 @@
 """
 口袋48房间消息抓取工具
-用于抓取成员房间消息并保存到 SQLite。
+用于抓取成员房间消息并保存到数据库。
 
 注意：此工具仅供学习研究使用，请遵守口袋48用户协议。
 """
 
 import json
-import csv
 import time
-import sqlite3
 import logging
 from typing import Any, Dict, List, Optional
 from pathlib import Path
-from abc import ABC, abstractmethod
 
 import requests
+
+from message_storage import MessageStorage, create_storage
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-
-class MessageStorage(ABC):
-    """消息存储抽象类"""
-
-    @abstractmethod
-    def save_message(self, message: Dict[str, Any]) -> bool:
-        pass
-
-    @abstractmethod
-    def get_messages(self, room_id: str, limit: int = 100) -> List[Dict[str, Any]]:
-        pass
-
-
-class SQLiteStorage(MessageStorage):
-    """SQLite 存储实现"""
-
-    def __init__(self, db_path: str = "messages.db"):
-        self.db_path = db_path
-        self._init_database()
-
-    def _init_database(self):
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                room_id TEXT NOT NULL,
-                message_id TEXT UNIQUE,
-                user_id TEXT,
-                username TEXT,
-                content TEXT,
-                msg_type TEXT,
-                ext_info TEXT,
-                timestamp INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_room_id
-            ON messages(room_id, timestamp DESC)
-        """)
-
-        conn.commit()
-        conn.close()
-        logger.info("数据库初始化完成: %s", self.db_path)
-
-    def save_message(self, message: Dict[str, Any]) -> bool:
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-
-            cursor.execute("""
-                INSERT OR IGNORE INTO messages
-                (room_id, message_id, user_id, username, content, msg_type, ext_info, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                message.get('room_id'),
-                message.get('message_id'),
-                message.get('user_id'),
-                message.get('username'),
-                message.get('content'),
-                message.get('msg_type'),
-                message.get('ext_info'),
-                message.get('timestamp')
-            ))
-
-            conn.commit()
-            affected = cursor.rowcount
-            conn.close()
-            return affected > 0
-
-        except Exception as exc:
-            logger.error("保存消息失败: %s", exc)
-            return False
-
-    def get_messages(self, room_id: str, limit: int = 100) -> List[Dict[str, Any]]:
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            SELECT room_id, message_id, user_id, username, content, msg_type, ext_info, timestamp, created_at
-            FROM messages
-            WHERE room_id = ?
-            ORDER BY timestamp DESC
-            LIMIT ?
-        """, (room_id, limit))
-
-        rows = cursor.fetchall()
-        conn.close()
-
-        return [
-            {
-                'room_id': row[0],
-                'message_id': row[1],
-                'user_id': row[2],
-                'username': row[3],
-                'content': row[4],
-                'msg_type': row[5],
-                'ext_info': row[6],
-                'timestamp': row[7],
-                'created_at': row[8],
-            }
-            for row in rows
-        ]
-
-    def get_latest_message(self, room_id: str) -> Optional[Dict[str, Any]]:
-        messages = self.get_messages(room_id, limit=1)
-        return messages[0] if messages else None
-
-    def export_messages(self, output_path: str, room_id: Optional[str] = None, limit: Optional[int] = None,
-                        output_format: str = 'json'):
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        query = """
-            SELECT room_id, message_id, user_id, username, content, msg_type, ext_info, timestamp, created_at
-            FROM messages
-        """
-        params: List[Any] = []
-        conditions = []
-        if room_id:
-            conditions.append('room_id = ?')
-            params.append(room_id)
-        if conditions:
-            query += ' WHERE ' + ' AND '.join(conditions)
-        query += ' ORDER BY timestamp DESC'
-        if limit is not None:
-            query += ' LIMIT ?'
-            params.append(limit)
-
-        rows = cursor.execute(query, params).fetchall()
-        conn.close()
-
-        messages = [
-            {
-                'room_id': row[0],
-                'message_id': row[1],
-                'user_id': row[2],
-                'username': row[3],
-                'content': row[4],
-                'msg_type': row[5],
-                'ext_info': row[6],
-                'timestamp': row[7],
-                'created_at': row[8],
-            }
-            for row in rows
-        ]
-
-        if output_format == 'json':
-            with open(output_path, 'w', encoding='utf-8') as file:
-                json.dump(messages, file, ensure_ascii=False, indent=2)
-            return len(messages)
-
-        if output_format == 'csv':
-            fieldnames = [
-                'room_id', 'message_id', 'user_id', 'username', 'content',
-                'msg_type', 'ext_info', 'timestamp', 'created_at'
-            ]
-            with open(output_path, 'w', encoding='utf-8', newline='') as file:
-                writer = csv.DictWriter(file, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(messages)
-            return len(messages)
-
-        raise ValueError(f'不支持的导出格式: {output_format}')
-
 
 class Pocket48Client:
     """口袋48 API 客户端"""
@@ -211,13 +41,7 @@ class Pocket48Client:
             return json.load(file)
 
     def _init_storage(self) -> MessageStorage:
-        storage_config = self.config.get('storage', {})
-        storage_type = storage_config.get('type', 'sqlite')
-        db_path = storage_config.get('database', 'messages.db')
-
-        if storage_type != 'sqlite':
-            raise ValueError(f"不支持的存储类型: {storage_type}")
-        return SQLiteStorage(db_path)
+        return create_storage(self.config)
 
     def _api_config(self) -> Dict[str, Any]:
         return self.config.get('api', {})
@@ -353,6 +177,8 @@ class Pocket48Client:
                 user_info = self._extract_user_from_ext(ext_info)
                 normalized_messages.append({
                     'room_id': room_id,
+                    'owner_member_id': server_id,
+                    'member_name': member.get('name', room_id),
                     'message_id': msg.get('msgIdServer') or msg.get('msgIdClient'),
                     'user_id': user_info.get('userId'),
                     'username': user_info.get('nickName'),
@@ -380,9 +206,7 @@ class Pocket48Client:
         return saved_count
 
     def _get_latest_local_message(self, room_id: str) -> Optional[Dict[str, Any]]:
-        if isinstance(self.storage, SQLiteStorage):
-            return self.storage.get_latest_message(room_id)
-        return None
+        return self.storage.get_latest_message(room_id)
 
     def _filter_new_messages(self, room_id: str, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         latest_local = self._get_latest_local_message(room_id)
@@ -418,7 +242,17 @@ class Pocket48Client:
 
                 if messages:
                     saved = self.save_messages(messages)
+                    latest_message = max(messages, key=lambda item: item.get('timestamp') or 0)
+                    self.storage.record_fetch(
+                        room_id=room_id,
+                        messages_count=saved,
+                        status='success',
+                        last_message_id=latest_message.get('message_id'),
+                        last_message_time_ms=latest_message.get('timestamp'),
+                    )
                     logger.info("房间 %s 保存了 %s 条新消息", room_id, saved)
+                else:
+                    self.storage.record_fetch(room_id=room_id, messages_count=0, status='success')
 
                 first_fetch = False
 
@@ -429,6 +263,7 @@ class Pocket48Client:
                 break
             except Exception as exc:
                 logger.error("监控异常: %s", exc)
+                self.storage.record_fetch(room_id=room_id, messages_count=0, status='failed', error_message=str(exc))
                 time.sleep(interval * 2)
 
 
@@ -458,9 +293,6 @@ class MessageScraper:
                 self.client.monitor_room(member, interval=interval, limit=limit)
 
     def export(self, output_path: str, output_format: str, room_id: Optional[str], limit: Optional[int]):
-        if not isinstance(self.client.storage, SQLiteStorage):
-            raise ValueError('当前仅支持从 SQLite 导出消息')
-
         count = self.client.storage.export_messages(
             output_path=output_path,
             room_id=room_id,

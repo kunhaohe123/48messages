@@ -1,6 +1,6 @@
 # 口袋48房间消息抓取工具
 
-用于抓取口袋48成员的聚聚房间消息。
+用于抓取口袋48成员的聚聚房间消息，并写入 MySQL。
 
 ## 项目结构
 
@@ -118,4 +118,4 @@ python pocket48_scraper.py -c config.json --export-format json --output latest.j
 - [x] 对接房间消息接口
 - [ ] 添加WebSocket实时消息支持
 - [ ] 还原密码加密算法
-- [ ] 添加更多存储方式（MySQL、MongoDB）
+- [x] 写入 MySQL（members / rooms / messages / message_payloads / crawl_tasks / crawl_checkpoints）

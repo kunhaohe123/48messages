@@ -34,8 +34,14 @@
     "retry_delay": 5
   },
   "storage": {
-    "type": "sqlite",
-    "database": "messages.db"
+    "type": "mysql",
+    "host": "localhost",
+    "port": 3306,
+    "database": "48pocket",
+    "user": "root",
+    "password": "",
+    "charset": "utf8mb4",
+    "token_file": "token.json"
   },
   "monitor": {
     "interval": 60,
