@@ -1,0 +1,44 @@
+{
+  "pocket48": {
+    "mobile": "手机号",
+    "encryptedPassword": "抓包得到的加密密码",
+    "deviceToken": "",
+    "token": "可选，已登录时可直接填写",
+    "userAgent": "PocketFans201807/7.1.35 (iPad; iOS 26.3.1; Scale/2.00)",
+    "appInfo": {
+      "vendor": "apple",
+      "deviceId": "你的设备ID",
+      "appVersion": "7.1.35",
+      "appBuild": "25101021",
+      "osVersion": "26.3.1",
+      "osType": "ios",
+      "deviceName": "iPad16,2",
+      "os": "ios"
+    },
+    "pa": "抓包得到的pa请求头",
+    "pSignType": "V0"
+  },
+  "members": [
+    {
+      "name": "成员名字",
+      "serverId": 951577,
+      "channelId": 1312655
+    }
+  ],
+  "api": {
+    "base_url": "https://pocketapi.48.cn",
+    "login_path": "/user/api/v2/login/app/app_login",
+    "message_list_path": "/im/api/v1/team/message/list/all",
+    "timeout": 30,
+    "retry_times": 3,
+    "retry_delay": 5
+  },
+  "storage": {
+    "type": "sqlite",
+    "database": "messages.db"
+  },
+  "monitor": {
+    "interval": 60,
+    "enabled": true
+  }
+}

@@ -1,0 +1,5 @@
+config.json
+messages.db
+token.json
+__pycache__/
+*.pyc
