@@ -59,7 +59,16 @@ cp config.example.json config.json
       "serverId": 951577,
       "channelId": 1312655
     }
-  ]
+  ],
+  "storage": {
+    "type": "mysql",
+    "host": "localhost",
+    "port": 3306,
+    "database": "48pocket",
+    "user": "root",
+    "password": "",
+    "charset": "utf8mb4"
+  }
 }
 ```
 
