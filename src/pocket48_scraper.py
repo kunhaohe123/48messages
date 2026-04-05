@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_CONFIG_PATH = 'config/config.json'
-DEFAULT_TOKEN_PATH = 'data/token.json'
+DEFAULT_TOKEN_PATH = 'data/runtime/token.json'
 
 
 class TokenManager:
@@ -42,6 +42,7 @@ class TokenManager:
             return json.load(file)
 
     def _save_token(self):
+        Path(self.token_file).parent.mkdir(parents=True, exist_ok=True)
         with open(self.token_file, 'w', encoding='utf-8') as file:
             json.dump(self.token_data, file, ensure_ascii=False, indent=2)
 

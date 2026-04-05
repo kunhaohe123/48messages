@@ -1,5 +1,5 @@
 config/config.json
-data/token.json
+data/runtime/token.json
 __pycache__/
 *.pyc
 .DS_Store

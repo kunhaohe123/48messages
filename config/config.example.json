@@ -41,7 +41,7 @@
     "user": "root",
     "password": "",
     "charset": "utf8mb4",
-    "token_file": "data/token.json"
+    "token_file": "data/runtime/token.json"
   },
   "monitor": {
     "interval": 60,

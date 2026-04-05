@@ -10,7 +10,8 @@
 │   ├── config.example.json  # 配置文件模板
 │   └── config.json          # 本地配置（忽略提交）
 ├── data/
-│   ├── token.json           # 本地 token 缓存（忽略提交）
+│   ├── runtime/
+│   │   └── token.json       # 本地 token 缓存（忽略提交）
 │   └── messages_export.json # 导出数据（忽略提交）
 ├── docs/
 │   ├── 抓包分析指南.md
@@ -78,7 +79,7 @@ cp config/config.example.json config/config.json
     "user": "root",
     "password": "",
     "charset": "utf8mb4",
-    "token_file": "data/token.json"
+    "token_file": "data/runtime/token.json"
   }
 }
 ```
