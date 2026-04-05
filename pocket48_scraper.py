@@ -6,6 +6,7 @@
 """
 
 import json
+import csv
 import time
 import sqlite3
 import logging
@@ -131,6 +132,63 @@ class SQLiteStorage(MessageStorage):
     def get_latest_message(self, room_id: str) -> Optional[Dict[str, Any]]:
         messages = self.get_messages(room_id, limit=1)
         return messages[0] if messages else None
+
+    def export_messages(self, output_path: str, room_id: Optional[str] = None, limit: Optional[int] = None,
+                        output_format: str = 'json'):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        query = """
+            SELECT room_id, message_id, user_id, username, content, msg_type, ext_info, timestamp, created_at
+            FROM messages
+        """
+        params: List[Any] = []
+        conditions = []
+        if room_id:
+            conditions.append('room_id = ?')
+            params.append(room_id)
+        if conditions:
+            query += ' WHERE ' + ' AND '.join(conditions)
+        query += ' ORDER BY timestamp DESC'
+        if limit is not None:
+            query += ' LIMIT ?'
+            params.append(limit)
+
+        rows = cursor.execute(query, params).fetchall()
+        conn.close()
+
+        messages = [
+            {
+                'room_id': row[0],
+                'message_id': row[1],
+                'user_id': row[2],
+                'username': row[3],
+                'content': row[4],
+                'msg_type': row[5],
+                'ext_info': row[6],
+                'timestamp': row[7],
+                'created_at': row[8],
+            }
+            for row in rows
+        ]
+
+        if output_format == 'json':
+            with open(output_path, 'w', encoding='utf-8') as file:
+                json.dump(messages, file, ensure_ascii=False, indent=2)
+            return len(messages)
+
+        if output_format == 'csv':
+            fieldnames = [
+                'room_id', 'message_id', 'user_id', 'username', 'content',
+                'msg_type', 'ext_info', 'timestamp', 'created_at'
+            ]
+            with open(output_path, 'w', encoding='utf-8', newline='') as file:
+                writer = csv.DictWriter(file, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(messages)
+            return len(messages)
+
+        raise ValueError(f'不支持的导出格式: {output_format}')
 
 
 class Pocket48Client:
@@ -399,16 +457,42 @@ class MessageScraper:
             if member.get('channelId') is not None and member.get('serverId') is not None:
                 self.client.monitor_room(member, interval=interval, limit=limit)
 
+    def export(self, output_path: str, output_format: str, room_id: Optional[str], limit: Optional[int]):
+        if not isinstance(self.client.storage, SQLiteStorage):
+            raise ValueError('当前仅支持从 SQLite 导出消息')
+
+        count = self.client.storage.export_messages(
+            output_path=output_path,
+            room_id=room_id,
+            limit=limit,
+            output_format=output_format,
+        )
+        logger.info('已导出 %s 条消息到 %s', count, output_path)
+
 
 def main():
     import argparse
 
     parser = argparse.ArgumentParser(description='口袋48房间消息抓取工具')
     parser.add_argument('-c', '--config', default='config.json', help='配置文件路径')
+    parser.add_argument('--export-format', choices=['json', 'csv'], help='导出数据库中的消息')
+    parser.add_argument('--output', help='导出文件路径')
+    parser.add_argument('--room-id', help='仅导出指定房间的消息')
+    parser.add_argument('--limit', type=int, help='导出消息数量上限')
     args = parser.parse_args()
 
     try:
         scraper = MessageScraper(args.config)
+        if args.export_format:
+            if not args.output:
+                raise ValueError('使用导出功能时必须提供 --output')
+            scraper.export(
+                output_path=args.output,
+                output_format=args.export_format,
+                room_id=args.room_id,
+                limit=args.limit,
+            )
+            return
         scraper.run()
     except Exception as exc:
         logger.error("程序异常: %s", exc)

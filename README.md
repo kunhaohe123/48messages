@@ -84,6 +84,26 @@ pip install -r requirements.txt
 python pocket48_scraper.py -c config.json
 ```
 
+### 6. 导出已抓取消息
+
+导出为 JSON：
+
+```bash
+python pocket48_scraper.py -c config.json --export-format json --output messages.json
+```
+
+导出为 CSV：
+
+```bash
+python pocket48_scraper.py -c config.json --export-format csv --output messages.csv
+```
+
+只导出单个房间最近 20 条：
+
+```bash
+python pocket48_scraper.py -c config.json --export-format json --output latest.json --room-id 1312655 --limit 20
+```
+
 ## 重要提示
 
 ⚠️ **仅供学习研究使用，请遵守口袋48用户协议**
