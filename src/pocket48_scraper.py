@@ -23,10 +23,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class TokenManager:
-    """Token 管理器"""
+DEFAULT_CONFIG_PATH = 'config/config.json'
+DEFAULT_TOKEN_PATH = 'data/token.json'
 
-    def __init__(self, token_file: str = 'token.json'):
+
+class TokenManager:
+    """负责本地缓存 token，并在过期后让上层重新登录。"""
+
+    def __init__(self, token_file: str = DEFAULT_TOKEN_PATH):
         self.token_file = token_file
         self.token_data = self._load_token()
 
@@ -66,13 +70,13 @@ class TokenManager:
         logger.info('Token 已清除')
 
 class Pocket48Client:
-    """口袋48 API 客户端"""
+    """封装配置加载、登录、消息抓取和存储访问。"""
 
-    def __init__(self, config_path: str = "config.json"):
+    def __init__(self, config_path: str = DEFAULT_CONFIG_PATH):
         self.config = self._load_config(config_path)
         self.session = requests.Session()
         self.storage = self._init_storage()
-        token_file = self.config.get('storage', {}).get('token_file', 'token.json')
+        token_file = self.config.get('storage', {}).get('token_file', DEFAULT_TOKEN_PATH)
         self.token_manager = TokenManager(token_file)
         configured_token = self.config.get('pocket48', {}).get('token')
         if configured_token and not self.token_manager.get_token():
@@ -102,6 +106,7 @@ class Pocket48Client:
         return json.dumps(app_info, ensure_ascii=False, separators=(',', ':'))
 
     def _setup_session(self):
+        # 这些请求头来自抓包结果，初始化后整个 Session 复用同一套指纹。
         pocket48_config = self._pocket48_config()
         headers = {
             'Accept': '*/*',
@@ -148,6 +153,7 @@ class Pocket48Client:
             logger.error("缺少 mobile 或 encryptedPassword，无法登录")
             return False
 
+        # 登录接口要求的主体基本固定，真正会变化的是配置里的账号和抓包字段。
         payload = {
             'deviceToken': pocket48_config.get('deviceToken', ''),
             'loginType': 'MOBILE_PWD',
@@ -224,6 +230,7 @@ class Pocket48Client:
             messages = content.get('message', [])
             normalized_messages = []
             room_id = str(channel_id)
+            # 统一整理成存储层可直接消费的结构，避免数据库实现感知接口细节。
             for msg in messages:
                 ext_info = msg.get('extInfo', '')
                 user_info = self._extract_user_from_ext(ext_info)
@@ -267,6 +274,7 @@ class Pocket48Client:
         if not latest_local:
             return messages
 
+        # 接口每次都拉最新一页，这里用本地最后一条消息做增量过滤。
         latest_timestamp = latest_local.get('timestamp') or 0
         latest_message_id = latest_local.get('message_id')
         filtered: List[Dict[str, Any]] = []
@@ -323,9 +331,9 @@ class Pocket48Client:
 
 
 class MessageScraper:
-    """消息抓取器主类"""
+    """面向 CLI 的高层调度器。"""
 
-    def __init__(self, config_path: str = "config.json"):
+    def __init__(self, config_path: str = DEFAULT_CONFIG_PATH):
         self.client = Pocket48Client(config_path)
         self.config = self.client.config
         self.threads: List[threading.Thread] = []
@@ -335,6 +343,7 @@ class MessageScraper:
         if not member_names:
             return members
 
+        # CLI 允许重复传入 --member，这里统一按名称过滤并提示缺失项。
         selected = [member for member in members if member.get('name') in set(member_names)]
         missing_names = [name for name in member_names if name not in {member.get('name') for member in selected}]
         for name in missing_names:
@@ -384,6 +393,7 @@ class MessageScraper:
 
         try:
             if semaphore is not None:
+                # 用信号量限制并发成员数，避免一次性打太多请求。
                 semaphore.acquire()
             result = self.client.get_room_messages(member, limit=fetch_limit, next_time=0)
             messages = result['messages']
@@ -454,12 +464,26 @@ class MessageScraper:
         )
         logger.info('已导出 %s 条消息到 %s', count, output_path)
 
+    def get_statistics(self) -> Dict[str, Any]:
+        return self.client.storage.get_statistics()
+
+
+def print_statistics(stats: Dict[str, Any]):
+    """将存储层返回的统计结果格式化输出到终端。"""
+    print('\n=== 抓取统计 ===')
+    print(f"总消息数: {stats['total_messages']}")
+    print(f"监控房间数: {stats['total_rooms']}")
+    print(f"成功抓取次数: {stats['successful_fetches']}")
+    print('\n消息数前10的房间:')
+    for room, count in stats['top_rooms']:
+        print(f'  {room}: {count} 条')
+
 
 def main():
     import argparse
 
     parser = argparse.ArgumentParser(description='口袋48房间消息抓取工具')
-    parser.add_argument('-c', '--config', default='config.json', help='配置文件路径')
+    parser.add_argument('-c', '--config', default=DEFAULT_CONFIG_PATH, help='配置文件路径')
     parser.add_argument('--export-format', choices=['json', 'csv'], help='导出数据库中的消息')
     parser.add_argument('--output', help='导出文件路径')
     parser.add_argument('--room-id', help='仅导出指定房间的消息')
@@ -467,10 +491,14 @@ def main():
     parser.add_argument('--once', action='store_true', help='每个成员只抓取一次后退出')
     parser.add_argument('--member', action='append', help='仅抓取指定成员，可重复传入')
     parser.add_argument('--workers', type=int, help='单次抓取时的最大并发成员数')
+    parser.add_argument('--stats', action='store_true', help='显示抓取统计信息')
     args = parser.parse_args()
 
     try:
         scraper = MessageScraper(args.config)
+        if args.stats:
+            print_statistics(scraper.get_statistics())
+            return
         if args.export_format:
             if not args.output:
                 raise ValueError('使用导出功能时必须提供 --output')

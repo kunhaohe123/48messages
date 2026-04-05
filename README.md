@@ -6,17 +6,27 @@
 
 ```
 48messages/
-├── 抓包分析指南.md      # 详细的抓包分析步骤
-├── config.example.json  # 配置文件模板
-├── pocket48_scraper.py  # 主程序
-└── requirements.txt    # Python依赖
+├── config/
+│   ├── config.example.json  # 配置文件模板
+│   └── config.json          # 本地配置（忽略提交）
+├── data/
+│   ├── token.json           # 本地 token 缓存（忽略提交）
+│   └── messages_export.json # 导出数据（忽略提交）
+├── docs/
+│   ├── 抓包分析指南.md
+│   ├── 持久化抓取指南.md
+│   └── Charles抓包配置指南.md
+├── src/
+│   ├── pocket48_scraper.py  # 统一主程序
+│   └── message_storage.py
+└── requirements.txt         # Python 依赖
 ```
 
 ## 使用步骤
 
 ### 1. 抓包分析（最重要）
 
-详细步骤请查看 [抓包分析指南.md](抓包分析指南.md)
+详细步骤请查看 [docs/抓包分析指南.md](docs/抓包分析指南.md)
 
 主要步骤：
 1. 使用Charles/Fiddler抓包工具
@@ -27,10 +37,10 @@
 ### 2. 配置项目
 
 ```bash
-cp config.example.json config.json
+cp config/config.example.json config/config.json
 ```
 
-编辑 `config.json`：
+编辑 `config/config.json`：
 
 ```json
 {
@@ -68,7 +78,7 @@ cp config.example.json config.json
     "user": "root",
     "password": "",
     "charset": "utf8mb4",
-    "token_file": "token.json"
+    "token_file": "data/token.json"
   }
 }
 ```
@@ -90,8 +100,16 @@ pip install -r requirements.txt
 
 ### 5. 运行程序
 
+`src/pocket48_scraper.py` 现在是统一入口，抓取、导出、统计都从这里执行。
+
 ```bash
-python pocket48_scraper.py -c config.json
+python src/pocket48_scraper.py -c config/config.json
+```
+
+查看统计：
+
+```bash
+python src/pocket48_scraper.py -c config/config.json --stats
 ```
 
 ### 6. 导出已抓取消息
@@ -99,19 +117,19 @@ python pocket48_scraper.py -c config.json
 导出为 JSON：
 
 ```bash
-python pocket48_scraper.py -c config.json --export-format json --output messages.json
+python src/pocket48_scraper.py -c config/config.json --export-format json --output data/messages.json
 ```
 
 导出为 CSV：
 
 ```bash
-python pocket48_scraper.py -c config.json --export-format csv --output messages.csv
+python src/pocket48_scraper.py -c config/config.json --export-format csv --output data/messages.csv
 ```
 
 只导出单个房间最近 20 条：
 
 ```bash
-python pocket48_scraper.py -c config.json --export-format json --output latest.json --room-id 1312655 --limit 20
+python src/pocket48_scraper.py -c config/config.json --export-format json --output data/latest.json --room-id 1312655 --limit 20
 ```
 
 ## 重要提示

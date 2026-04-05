@@ -1,7 +1,6 @@
-config.json
-messages.db
-token.json
+config/config.json
+data/token.json
 __pycache__/
 *.pyc
 .DS_Store
-messages_export.json
+data/messages_export.json

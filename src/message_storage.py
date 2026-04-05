@@ -51,6 +51,7 @@ def _find_first_value(data: Any, keys: set[str]) -> Optional[Any]:
 
 
 def _extract_text_content(body: Any, ext_info: Any) -> Optional[str]:
+    # 不同消息类型把文本放在不同字段里，这里尽量抽取出一个可检索的文本摘要。
     candidates: List[str] = []
     for source in (_parse_json_like(body), _parse_json_like(ext_info)):
         if isinstance(source, str):
@@ -74,6 +75,7 @@ def _extract_text_content(body: Any, ext_info: Any) -> Optional[str]:
 
 
 def _extract_media_fields(body: Any, ext_info: Any) -> Dict[str, Any]:
+    # 消息体和 extInfo 的字段命名并不稳定，这里做一层宽松归一化。
     merged = {
         'body': _parse_json_like(body),
         'extInfo': _parse_json_like(ext_info),
@@ -103,6 +105,7 @@ def _timestamp_ms_to_datetime(value: Any) -> datetime:
 
 
 class MessageStorage(ABC):
+    """统一存储接口，抓取层只依赖这些能力，不关心底层是 SQLite 还是 MySQL。"""
     @abstractmethod
     def save_message(self, message: Dict[str, Any]) -> bool:
         pass
@@ -140,7 +143,7 @@ class MessageStorage(ABC):
 
 
 class SQLiteStorage(MessageStorage):
-    def __init__(self, db_path: str = 'messages.db'):
+    def __init__(self, db_path: str = 'data/messages.db'):
         self.db_path = db_path
         self._init_database()
 
@@ -148,6 +151,7 @@ class SQLiteStorage(MessageStorage):
         return sqlite3.connect(self.db_path)
 
     def _init_database(self):
+        # SQLite 版本只保留最小表结构，适合本地试跑和调试。
         conn = self._connect()
         cursor = conn.cursor()
         cursor.execute("""
@@ -369,6 +373,7 @@ class MySQLStorage(MessageStorage):
         conn = self._connect()
         try:
             with conn.cursor() as cursor:
+                # 先确保成员和房间主数据存在，再落消息正文和扩展载荷。
                 cursor.execute("""
                     INSERT INTO members (id, member_name, room_id)
                     VALUES (%s, %s, %s)
@@ -420,6 +425,7 @@ class MySQLStorage(MessageStorage):
                 ))
 
                 if inserted:
+                    # 只有消息主表首次写入成功时，才补充 payload 明细，避免重复写放大。
                     payload = _extract_media_fields(message.get('content'), message.get('ext_info'))
                     cursor.execute("""
                         INSERT INTO message_payloads (
@@ -475,6 +481,7 @@ class MySQLStorage(MessageStorage):
         conn = self._connect()
         try:
             with conn.cursor() as cursor:
+                # 批量写入时，成员和房间信息取第一条消息即可，它们在同一房间内应保持一致。
                 cursor.execute("""
                     INSERT INTO members (id, member_name, room_id)
                     VALUES (%s, %s, %s)
@@ -502,6 +509,7 @@ class MySQLStorage(MessageStorage):
 
                 message_rows = []
                 payload_rows = []
+                # 先在内存里整理好两张表要写的数据，再分别 executemany，减少往返次数。
                 for message in messages:
                     message_id = str(message.get('message_id') or '')
                     message_rows.append((
@@ -668,6 +676,7 @@ class MySQLStorage(MessageStorage):
         conn = self._connect()
         try:
             with conn.cursor() as cursor:
+                # crawl_tasks 记录每次抓取执行；成功时再刷新增量检查点，供后续观察状态。
                 cursor.execute("""
                     INSERT INTO crawl_tasks (
                         room_id, task_type, status, start_time_ms, end_time_ms,
@@ -730,10 +739,11 @@ class MySQLStorage(MessageStorage):
 
 
 def create_storage(config: Dict[str, Any]) -> MessageStorage:
+    """按配置选择具体存储实现。"""
     storage_config = config.get('storage', {})
     storage_type = storage_config.get('type', 'mysql')
     if storage_type == 'sqlite':
-        return SQLiteStorage(storage_config.get('database', 'messages.db'))
+        return SQLiteStorage(storage_config.get('database', 'data/messages.db'))
     if storage_type == 'mysql':
         return MySQLStorage(
             host=storage_config.get('host', 'localhost'),
