@@ -67,7 +67,8 @@ cp config.example.json config.json
     "database": "48pocket",
     "user": "root",
     "password": "",
-    "charset": "utf8mb4"
+    "charset": "utf8mb4",
+    "token_file": "token.json"
   }
 }
 ```

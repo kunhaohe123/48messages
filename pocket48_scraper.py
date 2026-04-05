@@ -21,6 +21,49 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+class TokenManager:
+    """Token 管理器"""
+
+    def __init__(self, token_file: str = 'token.json'):
+        self.token_file = token_file
+        self.token_data = self._load_token()
+
+    def _load_token(self) -> Dict[str, Any]:
+        path = Path(self.token_file)
+        if not path.exists():
+            return {}
+        with open(path, 'r', encoding='utf-8') as file:
+            return json.load(file)
+
+    def _save_token(self):
+        with open(self.token_file, 'w', encoding='utf-8') as file:
+            json.dump(self.token_data, file, ensure_ascii=False, indent=2)
+
+    def set_token(self, access_token: str, expires_in: int = 86400):
+        self.token_data = {
+            'access_token': access_token,
+            'expires_at': time.time() + expires_in,
+            'acquired_at': time.time(),
+        }
+        self._save_token()
+        logger.info('Token 已保存')
+
+    def get_token(self) -> Optional[str]:
+        if not self.token_data:
+            return None
+        if time.time() >= self.token_data.get('expires_at', 0):
+            logger.warning('Token 已过期')
+            return None
+        return self.token_data.get('access_token')
+
+    def clear(self):
+        self.token_data = {}
+        path = Path(self.token_file)
+        if path.exists():
+            path.unlink()
+        logger.info('Token 已清除')
+
 class Pocket48Client:
     """口袋48 API 客户端"""
 
@@ -28,7 +71,11 @@ class Pocket48Client:
         self.config = self._load_config(config_path)
         self.session = requests.Session()
         self.storage = self._init_storage()
-        self.auth_token = self.config.get('pocket48', {}).get('token')
+        token_file = self.config.get('storage', {}).get('token_file', 'token.json')
+        self.token_manager = TokenManager(token_file)
+        configured_token = self.config.get('pocket48', {}).get('token')
+        if configured_token and not self.token_manager.get_token():
+            self.token_manager.set_token(configured_token)
 
         self._setup_session()
 
@@ -73,9 +120,10 @@ class Pocket48Client:
         return f"{base_url}{path}"
 
     def _get_authenticated_headers(self) -> Dict[str, str]:
-        if not self.auth_token:
-            raise RuntimeError('未登录或缺少 token')
-        return {'token': self.auth_token}
+        token = self.token_manager.get_token()
+        if not token:
+            raise RuntimeError('未登录或缺少有效 token')
+        return {'token': token}
 
     def _extract_user_from_ext(self, ext_info: str) -> Dict[str, Any]:
         if not ext_info:
@@ -87,8 +135,8 @@ class Pocket48Client:
             return {}
 
     def login(self) -> bool:
-        if self.auth_token:
-            logger.info("使用配置中的 token，跳过登录")
+        if self.token_manager.get_token():
+            logger.info('使用已保存的 Token')
             return True
 
         pocket48_config = self._pocket48_config()
@@ -123,10 +171,14 @@ class Pocket48Client:
                 return False
 
             content = data.get('content', {})
-            self.auth_token = content.get('token') or content.get('userInfo', {}).get('token')
-            if not self.auth_token:
+            token = content.get('token') or content.get('userInfo', {}).get('token')
+            if not token:
                 logger.error("登录成功但未返回 token")
                 return False
+
+            valid_time_minutes = content.get('userInfo', {}).get('validTime', 40)
+            expires_in = max(int(valid_time_minutes) * 60, 600)
+            self.token_manager.set_token(token, expires_in)
 
             logger.info("登录成功: userId=%s", content.get('userInfo', {}).get('userId'))
             return True
@@ -136,8 +188,7 @@ class Pocket48Client:
             return False
 
     def get_room_messages(self, member: Dict[str, Any], limit: int = 100, next_time: int = 0) -> Dict[str, Any]:
-        if not self.auth_token:
-            logger.error("未登录或登录已过期")
+        if not self.login():
             return {'messages': [], 'next_time': next_time}
 
         server_id = member.get('serverId')
@@ -194,6 +245,12 @@ class Pocket48Client:
                 'next_time': content.get('nextTime', next_time),
             }
 
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code in {401, 403}:
+                logger.warning('Token 失效，清除后等待下次重新登录')
+                self.token_manager.clear()
+            logger.error("获取消息异常: %s", exc)
+            return {'messages': [], 'next_time': next_time}
         except Exception as exc:
             logger.error("获取消息异常: %s", exc)
             return {'messages': [], 'next_time': next_time}
