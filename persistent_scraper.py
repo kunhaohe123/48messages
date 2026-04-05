@@ -313,27 +313,66 @@ class PersistentPocket48Scraper:
         self.storage.commit()
         return saved_count
 
+    def _get_latest_local_message(self, room_id: str) -> Optional[Dict[str, Any]]:
+        cursor = self.storage.cursor()
+        row = cursor.execute(
+            """
+            SELECT message_id, timestamp
+            FROM messages
+            WHERE room_id = ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (room_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return {'message_id': row[0], 'timestamp': row[1]}
+
+    def _filter_new_messages(self, room_id: str, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        latest_local = self._get_latest_local_message(room_id)
+        if not latest_local:
+            return messages
+
+        latest_timestamp = latest_local.get('timestamp') or 0
+        latest_message_id = latest_local.get('message_id')
+        filtered: List[Dict[str, Any]] = []
+        for msg in messages:
+            msg_timestamp = msg.get('timestamp') or 0
+            msg_id = msg.get('message_id')
+            if msg_timestamp > latest_timestamp:
+                filtered.append(msg)
+                continue
+            if msg_timestamp == latest_timestamp and msg_id != latest_message_id:
+                filtered.append(msg)
+
+        return filtered
+
     def monitor_room(self, member: Dict[str, Any], interval: int = 60, limit: int = 100):
         room_id = str(member.get('channelId'))
         room_name = member.get('name', room_id)
         logger.info('开始监控房间 %s(%s)，间隔 %s 秒', room_name, room_id, interval)
 
-        next_time = 0
+        first_fetch = True
         consecutive_errors = 0
         max_errors = 5
 
         while self.running:
             try:
-                result = self.get_room_messages(member, limit=limit, next_time=next_time)
+                # 每轮只拉最新一页，依赖本地库判断哪些消息是新增的。
+                result = self.get_room_messages(member, limit=limit, next_time=0)
                 messages = result['messages']
-                next_time = result['next_time']
+                if not first_fetch:
+                    messages = self._filter_new_messages(room_id, messages)
 
                 if messages:
                     saved = self.save_messages(messages, room_id)
                     logger.info('房间 %s: 获取 %s 条，保存 %s 条新消息', room_id, len(messages), saved)
                     consecutive_errors = 0
                 else:
-                    consecutive_errors += 1
+                    consecutive_errors = 0
+
+                first_fetch = False
 
                 if consecutive_errors >= max_errors:
                     logger.warning('房间 %s 连续失败 %s 次，尝试重新登录', room_id, max_errors)

@@ -128,6 +128,10 @@ class SQLiteStorage(MessageStorage):
             for row in rows
         ]
 
+    def get_latest_message(self, room_id: str) -> Optional[Dict[str, Any]]:
+        messages = self.get_messages(room_id, limit=1)
+        return messages[0] if messages else None
+
 
 class Pocket48Client:
     """口袋48 API 客户端"""
@@ -317,20 +321,48 @@ class Pocket48Client:
                 saved_count += 1
         return saved_count
 
+    def _get_latest_local_message(self, room_id: str) -> Optional[Dict[str, Any]]:
+        if isinstance(self.storage, SQLiteStorage):
+            return self.storage.get_latest_message(room_id)
+        return None
+
+    def _filter_new_messages(self, room_id: str, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        latest_local = self._get_latest_local_message(room_id)
+        if not latest_local:
+            return messages
+
+        latest_timestamp = latest_local.get('timestamp') or 0
+        latest_message_id = latest_local.get('message_id')
+        filtered: List[Dict[str, Any]] = []
+        for msg in messages:
+            msg_timestamp = msg.get('timestamp') or 0
+            msg_id = msg.get('message_id')
+            if msg_timestamp > latest_timestamp:
+                filtered.append(msg)
+                continue
+            if msg_timestamp == latest_timestamp and msg_id != latest_message_id:
+                filtered.append(msg)
+
+        return filtered
+
     def monitor_room(self, member: Dict[str, Any], interval: int = 60, limit: int = 100):
         room_id = str(member.get('channelId'))
         logger.info("开始监控房间 %s，间隔 %s 秒", room_id, interval)
 
-        next_time = 0
+        first_fetch = True
         while True:
             try:
-                result = self.get_room_messages(member, limit=limit, next_time=next_time)
+                # 每轮都取最新一页，再用本地库过滤旧消息，避免持续向历史翻页。
+                result = self.get_room_messages(member, limit=limit, next_time=0)
                 messages = result['messages']
-                next_time = result['next_time']
+                if not first_fetch:
+                    messages = self._filter_new_messages(room_id, messages)
 
                 if messages:
                     saved = self.save_messages(messages)
                     logger.info("房间 %s 保存了 %s 条新消息", room_id, saved)
+
+                first_fetch = False
 
                 time.sleep(interval)
 
