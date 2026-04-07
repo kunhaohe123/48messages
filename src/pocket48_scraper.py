@@ -1,6 +1,6 @@
 """
-口袋48房间消息抓取工具
-用于抓取成员房间消息并保存到数据库。
+口袋48成员本人消息抓取工具
+用于抓取成员房间中的成员本人消息并保存到数据库。
 
 注意：此工具仅供学习研究使用，请遵守口袋48用户协议。
 """
@@ -180,6 +180,24 @@ class Pocket48Client:
         except json.JSONDecodeError:
             return {}
 
+    def _is_member_message(self, ext_info: str) -> bool:
+        if not ext_info:
+            return False
+        try:
+            data = json.loads(ext_info)
+        except json.JSONDecodeError:
+            return False
+
+        if not isinstance(data, dict):
+            return False
+
+        user = data.get("user") if isinstance(data.get("user"), dict) else None
+        if user and user.get("roleId") == 3:
+            return True
+
+        channel_role = data.get("channelRole")
+        return channel_role in (2, "2")
+
     def login(self) -> bool:
         if self.token_manager.get_token():
             logger.info("使用已保存的 Token")
@@ -279,6 +297,10 @@ class Pocket48Client:
             # 统一整理成存储层可直接消费的结构，避免数据库实现感知接口细节。
             for msg in messages:
                 ext_info = msg.get("extInfo", "")
+                if not self._is_member_message(ext_info):
+                    continue
+                if str(msg.get("msgType") or "") != "TEXT":
+                    continue
                 user_info = self._extract_user_from_ext(ext_info)
                 normalized_messages.append(
                     {
@@ -295,7 +317,7 @@ class Pocket48Client:
                     }
                 )
 
-            logger.info("获取到 %s 条消息", len(normalized_messages))
+            logger.info("获取到 %s 条成员 TEXT 消息", len(normalized_messages))
             return {
                 "messages": normalized_messages,
                 "next_time": content.get("nextTime", next_time),
@@ -611,7 +633,7 @@ def print_statistics(stats: Dict[str, Any]):
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="口袋48房间消息抓取工具")
+    parser = argparse.ArgumentParser(description="口袋48成员本人消息抓取工具")
     parser.add_argument(
         "-c", "--config", default=DEFAULT_CONFIG_PATH, help="配置文件路径"
     )

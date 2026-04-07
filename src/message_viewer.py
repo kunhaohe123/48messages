@@ -90,18 +90,21 @@ def render_layout(title: str, body: str) -> str:
     button {{ background: #2563eb; border-color: #2563eb; cursor: pointer; font-weight: 600; }}
     button:hover {{ background: #1d4ed8; transform: translateY(-1px); }}
     button:active {{ transform: translateY(0); }}
-    table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
-    th, td {{ padding: 12px 10px; border-bottom: 1px solid #263041; vertical-align: top; text-align: left; }}
+    table {{ width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 14px; }}
+    th, td {{ padding: 12px 10px; border-bottom: 1px solid #263041; vertical-align: middle; text-align: left; }}
     th {{ color: #94a3b8; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }}
     tr {{ transition: all 0.2s ease; }}
     tr:hover {{ background: rgba(51, 65, 85, 0.1); }}
     .mono {{ font-family: Consolas, Monaco, 'Courier New', monospace; word-break: break-all; }}
-    .content {{ max-width: 520px; white-space: pre-wrap; word-break: break-word; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; position: relative; }}
+    .cell-room {{ width: 180px; }}
+    .cell-sender {{ width: 180px; }}
+    .cell-type {{ width: 110px; }}
+    .cell-time {{ width: 220px; white-space: nowrap; }}
+    .content {{ width: 100%; white-space: pre-wrap; word-break: break-word; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; position: relative; line-height: 1.5; }}
     .content:hover {{ overflow: visible; -webkit-line-clamp: unset; background: rgba(15, 23, 42, 0.5); padding: 8px; border-radius: 8px; z-index: 1; }}
     .content-truncated {{ cursor: pointer; color: #94a3b8; font-size: 12px; margin-top: 4px; }}
     .badge {{ display: inline-block; padding: 4px 8px; background: #1e293b; border: 1px solid #334155; border-radius: 999px; font-size: 12px; font-weight: 500; }}
     .badge-member {{ background: #3b0764; border-color: #7c3aed; color: #f5d0fe; }}
-    .badge-fan {{ background: #0f172a; border-color: #334155; }}
     .badge-TEXT {{ background: #0f172a; border-color: #334155; }}
     .badge-IMAGE {{ background: #0c4a6e; border-color: #0ea5e9; color: #bae6fd; }}
     .badge-VOICE {{ background: #4338ca; border-color: #818cf8; color: #ddd6fe; }}
@@ -119,8 +122,6 @@ def render_layout(title: str, body: str) -> str:
     .toolbar {{ display: flex; gap: 12px; flex-wrap: wrap; }}
     .toolbar a {{ padding: 8px 12px; background: #0f172a; border: 1px solid #334155; border-radius: 999px; font-size: 14px; transition: all 0.2s ease; }}
     .toolbar a:hover {{ background: #1e293b; border-color: #475569; transform: translateY(-1px); }}
-    .row-member td {{ background: rgba(124, 58, 237, 0.1); }}
-    .row-member:hover td {{ background: rgba(124, 58, 237, 0.16); }}
     .loading {{ display: inline-block; width: 16px; height: 16px; border: 2px solid #334155; border-radius: 50%; border-top-color: #2563eb; animation: spin 1s ease-in-out infinite; }}
     @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
     @media (max-width: 900px) {{ 
@@ -130,14 +131,15 @@ def render_layout(title: str, body: str) -> str:
       form {{ grid-template-columns: 1fr; }}
       table, thead, tbody, th, td, tr {{ display: block; }}
       th {{ display: none; }}
-      td {{ padding: 10px 0; border-bottom: 1px dashed #263041; }}
-      td:first-child {{ padding-top: 16px; }}
-      td:last-child {{ padding-bottom: 16px; }}
-      tr {{ border-bottom: none; padding: 0; margin-bottom: 16px; border-radius: 8px; background: #0f172a; }}
-      tr:hover {{ background: #151b28; }}
-      td:before {{ content: attr(data-label); display: block; color: #64748b; font-size: 11px; text-transform: uppercase; margin-bottom: 4px; }}
-      .pager {{ flex-direction: column; align-items: stretch; gap: 8px; }}
-      .pager a {{ text-align: center; }}
+       td {{ padding: 10px 0; border-bottom: 1px dashed #263041; }}
+       td:first-child {{ padding-top: 16px; }}
+       td:last-child {{ padding-bottom: 16px; }}
+       tr {{ border-bottom: none; padding: 0; margin-bottom: 16px; border-radius: 8px; background: #0f172a; }}
+       tr:hover {{ background: #151b28; }}
+       td:before {{ content: attr(data-label); display: block; color: #64748b; font-size: 11px; text-transform: uppercase; margin-bottom: 4px; }}
+       .cell-room, .cell-sender, .cell-type, .cell-time {{ width: auto; white-space: normal; }}
+       .pager {{ flex-direction: column; align-items: stretch; gap: 8px; }}
+       .pager a {{ text-align: center; }}
     }}
   </style>
 </head>
@@ -161,8 +163,6 @@ def create_app(config_path: str) -> Flask:
         room_id = (request.args.get("room_id") or "").strip() or None
         sender_keyword = (request.args.get("sender") or "").strip() or None
         keyword = (request.args.get("keyword") or "").strip() or None
-        msg_type = (request.args.get("msg_type") or "").strip() or None
-        sender_role = (request.args.get("sender_role") or "").strip() or None
         start_time = (request.args.get("start_time") or "").strip()
         end_time = (request.args.get("end_time") or "").strip()
         start_time_ms = parse_datetime_local(start_time) if start_time else None
@@ -170,61 +170,41 @@ def create_app(config_path: str) -> Flask:
         offset = (page - 1) * page_size
 
         rooms = storage.list_rooms()
-        senders = storage.list_senders(room_id)
-        stats = storage.get_statistics()
-        msg_types = getattr(
-            storage,
-            "list_msg_types",
-            lambda: ["TEXT", "IMAGE", "VOICE", "VIDEO", "REPLY", "FLIP"],
-        )()
+        text_stats = storage.search_messages(
+            sender_role="member",
+            msg_type="TEXT",
+            limit=0,
+            offset=0,
+        )
 
         search_kwargs = {
             "room_id": room_id,
             "sender_keyword": sender_keyword,
             "keyword": keyword,
-            "msg_type": msg_type,
+            "msg_type": "TEXT",
             "start_time_ms": start_time_ms,
             "end_time_ms": end_time_ms,
         }
         result = storage.search_messages(
             **search_kwargs,
-            sender_role=sender_role,
+            sender_role="member",
             limit=page_size,
             offset=offset,
         )
         total = result["total"]
         items = result["items"]
-        if sender_role:
-            member_total = total if sender_role == "member" else 0
-            fan_total = total if sender_role == "fan" else 0
-        else:
-            member_result = storage.search_messages(
-                **search_kwargs,
-                sender_role="member",
-                limit=0,
-                offset=0,
-            )
-            member_total = member_result["total"]
-            fan_total = total - member_total
         total_pages = max(ceil(total / page_size), 1)
 
         filters = {
             "room_id": room_id or "",
             "sender": sender_keyword or "",
             "keyword": keyword or "",
-            "msg_type": msg_type or "",
-            "sender_role": sender_role or "",
             "start_time": start_time,
             "end_time": end_time,
             "page_size": page_size,
         }
 
         query_without_page = build_query_string(filters)
-        quick_filter_params = {
-            key: value for key, value in filters.items() if key != "sender_role"
-        }
-        member_only_href = f"/?page=1{build_query_string({**quick_filter_params, 'sender_role': 'member'})}"
-        fan_only_href = f"/?page=1{build_query_string({**quick_filter_params, 'sender_role': 'fan'})}"
 
         options = ['<option value="">全部房间</option>']
         for room in rooms:
@@ -232,13 +212,6 @@ def create_app(config_path: str) -> Flask:
             label = f"{room.get('name') or room['id']} ({room.get('message_count', 0)})"
             options.append(
                 f'<option value="{html.escape(str(room["id"]))}"{selected}>{html.escape(label)}</option>'
-            )
-
-        msg_type_options = ['<option value="">全部类型</option>']
-        for mt in msg_types:
-            selected = " selected" if str(mt) == (msg_type or "") else ""
-            msg_type_options.append(
-                f'<option value="{html.escape(str(mt))}"{selected}>{html.escape(str(mt))}</option>'
             )
 
         message_rows = []
@@ -250,83 +223,51 @@ def create_app(config_path: str) -> Flask:
                 or "-"
             )
             room_name = item.get("room_name") or item.get("room_id")
-            is_member = item.get("sender_role") == "member"
-            role_label = "成员" if is_member else "粉丝"
-            role_class = "badge-member" if is_member else "badge-fan"
             msg_type_class = f"badge-{item.get('msg_type') or 'TEXT'}"
-            row_class = "row-member" if is_member else ""
             message_rows.append(
                 f"""
-                <tr class="{row_class}">
-                  <td data-label="消息ID"><a class="mono" href="/messages/{html.escape(str(item['message_id']))}">{html.escape(str(item['message_id']))}</a></td>
-                  <td data-label="房间">{html.escape(str(room_name))}<div class="mono">{html.escape(str(item['room_id']))}</div></td>
-                  <td data-label="发送人">{html.escape(str(item.get('username') or '-'))}<div class="mono">{html.escape(str(item.get('user_id') or '-'))}</div><div><span class="badge {role_class}">{role_label}</span></div></td>
-                  <td data-label="类型"><span class="badge {msg_type_class}">{html.escape(str(item.get('msg_type') or '-'))}</span></td>
-                  <td data-label="内容" class="content" title="{html.escape(str(content))}">{html.escape(str(content))}</td>
-                  <td data-label="时间">{html.escape(format_timestamp(item.get('timestamp')))}</td>
+                <tr>
+                  <td data-label="房间" class="cell-room">{html.escape(str(room_name))}</td>
+                  <td data-label="内容" title="{html.escape(str(content))}"><div class="content">{html.escape(str(content))}</div></td>
+                  <td data-label="时间" class="cell-time">{html.escape(format_timestamp(item.get("timestamp")))}</td>
                 </tr>
                 """
             )
 
-        sender_hints = (
-            "".join(
-                f'<span class="badge">{html.escape(str(sender.get("username") or sender.get("user_id") or "-"))}</span>'
-                for sender in senders[:12]
-            )
-            or '<span class="badge">暂无成员</span>'
-        )
-
         body = f"""
         <div class="header">
           <div>
-            <h1>成员消息查看后台</h1>
-            <div>直接读取当前项目数据库中的消息记录</div>
+            <h1>口袋房间消息查看</h1>
           </div>
-          <div class="toolbar"><a href="/">刷新</a><a href="{member_only_href}">只看成员本人</a><a href="{fan_only_href}">只看粉丝</a></div>
+          <div class="toolbar"><a href="/">刷新</a></div>
         </div>
 
         <div class="panel stats">
-          <div class="stat"><div class="label">总消息数</div><div class="value">{stats['total_messages']}</div></div>
-          <div class="stat"><div class="label">房间数</div><div class="value">{stats['total_rooms']}</div></div>
-          <div class="stat"><div class="label">成功抓取次数</div><div class="value">{stats['successful_fetches']}</div></div>
-          <div class="stat"><div class="label">当前结果</div><div class="value">{total}</div></div>
-          <div class="stat"><div class="label">成员消息</div><div class="value">{member_total}</div></div>
-          <div class="stat"><div class="label">粉丝消息</div><div class="value">{fan_total}</div></div>
+          <div class="stat"><div class="label">TEXT 消息总数</div><div class="value">{text_stats["total"]}</div></div>
+          <div class="stat"><div class="label">房间数</div><div class="value">{len(rooms)}</div></div>
         </div>
 
         <div class="panel">
           <form method="get">
             <div>
               <label for="room_id">房间</label>
-              <select id="room_id" name="room_id">{''.join(options)}</select>
+              <select id="room_id" name="room_id">{"".join(options)}</select>
             </div>
             <div>
               <label for="sender">成员</label>
-              <input id="sender" name="sender" value="{html.escape(filters['sender'])}" placeholder="昵称或用户ID">
+              <input id="sender" name="sender" value="{html.escape(filters["sender"])}" placeholder="昵称或用户ID">
             </div>
             <div>
               <label for="keyword">关键词</label>
-              <input id="keyword" name="keyword" value="{html.escape(filters['keyword'])}" placeholder="消息内容、回复、附加字段">
-            </div>
-            <div>
-              <label for="sender_role">身份</label>
-              <select id="sender_role" name="sender_role">
-                <option value="">全部身份</option>
-                <option value="member"{' selected' if filters['sender_role'] == 'member' else ''}>成员本人</option>
-                <option value="fan"{' selected' if filters['sender_role'] == 'fan' else ''}>粉丝</option>
-              </select>
-            </div>
-<div>
-              <label for="msg_type">消息类型</label>
-              <select id="msg_type" name="msg_type">{''.join(msg_type_options)}</select>
+              <input id="keyword" name="keyword" value="{html.escape(filters["keyword"])}" placeholder="消息内容、回复、附加字段">
             </div>
             <div>
               <label for="start_time">开始时间</label>
-              <input id="start_time" name="start_time" type="date" value="{html.escape(filters['start_time'])}">
+              <input id="start_time" name="start_time" type="date" value="{html.escape(filters["start_time"])}">
             </div>
             <div>
               <label for="end_time">结束时间</label>
-              <input id="end_time" name="end_time" type="date" value="{html.escape(filters['end_time'])}">
+              <input id="end_time" name="end_time" type="date" value="{html.escape(filters["end_time"])}">
             </div>
             <div>
               <label for="page_size">每页条数</label>
@@ -334,23 +275,19 @@ def create_app(config_path: str) -> Flask:
             </div>
             <div><button type="submit">查询</button></div>
           </form>
-          <div style="margin-top:12px">常见成员: {sender_hints}</div>
         </div>
 
         <div class="panel">
           <table>
             <thead>
               <tr>
-                <th>消息ID</th>
                 <th>房间</th>
-                <th>发送人</th>
-                <th>类型</th>
                 <th>内容摘要</th>
                 <th>时间</th>
               </tr>
             </thead>
             <tbody>
-              {''.join(message_rows) or '<tr><td colspan="6">没有匹配到消息</td></tr>'}
+              {"".join(message_rows) or '<tr><td colspan="3">没有匹配到消息</td></tr>'}
             </tbody>
           </table>
         </div>
@@ -361,13 +298,13 @@ def create_app(config_path: str) -> Flask:
           <a href="/?page={max(page - 1, 1)}{query_without_page}">上一页</a>
           <a href="/?page={min(page + 1, total_pages)}{query_without_page}">下一页</a>
           <form method="get" style="display:inline-flex;gap:8px;align-items:center;">
-            {''.join(f'<input type="hidden" name="{k}" value="{html.escape(str(v))}">' for k, v in filters.items() if v)}
+            {"".join(f'<input type="hidden" name="{k}" value="{html.escape(str(v))}">' for k, v in filters.items() if v)}
             <label style="margin:0;font-size:12px;display:flex;align-items:center;gap:4px;">跳至<input type="number" name="page" min="1" max="{total_pages}" value="{page}" style="width:60px;padding:4px 8px;"></label>
             <button type="submit" style="padding:4px 12px;">跳转</button>
           </form>
         </div>
         """
-        return render_layout("成员消息查看后台", body)
+        return render_layout("口袋房间消息查看", body)
 
     @app.route("/messages/<message_id>")
     def message_detail(message_id: str) -> str:
@@ -385,26 +322,26 @@ def create_app(config_path: str) -> Flask:
         </div>
 
         <div class="grid">
-          <div class="kv"><div class="key">房间</div><div>{html.escape(str(message.get('room_name') or message.get('room_id') or '-'))}</div></div>
-          <div class="kv"><div class="key">发送人</div><div>{html.escape(str(message.get('username') or '-'))}</div><div class="mono">{html.escape(str(message.get('user_id') or '-'))}</div></div>
-          <div class="kv"><div class="key">身份</div><div>{'成员本人' if message.get('sender_role') == 'member' else '粉丝'}</div></div>
-          <div class="kv"><div class="key">消息类型</div><div>{html.escape(str(message.get('msg_type') or '-'))}</div></div>
-          <div class="kv"><div class="key">消息时间</div><div>{html.escape(format_timestamp(message.get('timestamp')))}</div></div>
+          <div class="kv"><div class="key">房间</div><div>{html.escape(str(message.get("room_name") or message.get("room_id") or "-"))}</div></div>
+          <div class="kv"><div class="key">发送人</div><div>{html.escape(str(message.get("username") or "-"))}</div><div class="mono">{html.escape(str(message.get("user_id") or "-"))}</div></div>
+          <div class="kv"><div class="key">身份</div><div>成员本人</div></div>
+          <div class="kv"><div class="key">消息类型</div><div>{html.escape(str(message.get("msg_type") or "-"))}</div></div>
+          <div class="kv"><div class="key">消息时间</div><div>{html.escape(format_timestamp(message.get("timestamp")))}</div></div>
         </div>
 
         <div class="panel">
           <h2>文本内容</h2>
-          <pre>{html.escape(str(message.get('content') or '-'))}</pre>
+          <pre>{html.escape(str(message.get("content") or "-"))}</pre>
         </div>
 
         <div class="panel">
           <h2>扩展字段</h2>
-          <pre>{html.escape(pretty_json(message.get('ext_info')))}</pre>
+          <pre>{html.escape(pretty_json(message.get("ext_info")))}</pre>
         </div>
 
         <div class="panel">
           <h2>原始摘要</h2>
-          <pre>{html.escape(pretty_json(message.get('raw_brief')))}</pre>
+          <pre>{html.escape(pretty_json(message.get("raw_brief")))}</pre>
         </div>
         """
         return render_layout("消息详情", body)
@@ -413,7 +350,7 @@ def create_app(config_path: str) -> Flask:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="口袋48消息查看后台")
+    parser = argparse.ArgumentParser(description="口袋房间消息查看")
     parser.add_argument(
         "-c", "--config", default=DEFAULT_CONFIG_PATH, help="配置文件路径"
     )
