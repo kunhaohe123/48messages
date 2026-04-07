@@ -45,6 +45,24 @@ _setup_console_encoding()
 
 DEFAULT_CONFIG_PATH = "config/config.json"
 DEFAULT_TOKEN_PATH = "data/runtime/token.json"
+DEFAULT_MEMBERS_FILENAME = "members.json"
+
+
+def load_config(config_path: str) -> Dict[str, Any]:
+    path = Path(config_path)
+    if not path.exists():
+        raise FileNotFoundError(f"配置文件不存在: {config_path}")
+
+    with open(path, "r", encoding="utf-8") as file:
+        config = json.load(file)
+
+    members_path = path.parent / DEFAULT_MEMBERS_FILENAME
+    if not members_path.exists():
+        raise FileNotFoundError(f"成员配置文件不存在: {members_path}")
+    with open(members_path, "r", encoding="utf-8") as file:
+        config["members"] = json.load(file)
+
+    return config
 
 
 class TokenManager:
@@ -95,7 +113,7 @@ class Pocket48Client:
     """封装配置加载、登录、消息抓取和存储访问。"""
 
     def __init__(self, config_path: str = DEFAULT_CONFIG_PATH):
-        self.config = self._load_config(config_path)
+        self.config = load_config(config_path)
         self._thread_local = threading.local()
         self.storage = self._init_storage()
         token_file = self.config.get("storage", {}).get(
@@ -113,14 +131,6 @@ class Pocket48Client:
             self._setup_session(session)
             self._thread_local.session = session
         return session
-
-    def _load_config(self, config_path: str) -> Dict[str, Any]:
-        path = Path(config_path)
-        if not path.exists():
-            raise FileNotFoundError(f"配置文件不存在: {config_path}")
-
-        with open(path, "r", encoding="utf-8") as file:
-            return json.load(file)
 
     def _init_storage(self) -> MessageStorage:
         return create_storage(self.config)

@@ -9,12 +9,7 @@ from typing import Any, Dict, Optional
 from flask import Flask, abort, request
 
 from message_storage import create_storage
-from pocket48_scraper import DEFAULT_CONFIG_PATH
-
-
-def load_config(config_path: str) -> Dict[str, Any]:
-    with open(config_path, "r", encoding="utf-8") as file:
-        return json.load(file)
+from pocket48_scraper import DEFAULT_CONFIG_PATH, load_config
 
 
 def format_timestamp(value: Any) -> str:

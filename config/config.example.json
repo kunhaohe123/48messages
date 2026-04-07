@@ -18,13 +18,6 @@
     "pa": "抓包得到的pa请求头",
     "pSignType": "V0"
   },
-  "members": [
-    {
-      "name": "成员名字",
-      "serverId": 951577,
-      "channelId": 1312655
-    }
-  ],
   "api": {
     "base_url": "https://pocketapi.48.cn",
     "login_path": "/user/api/v2/login/app/app_login",

@@ -39,9 +39,10 @@
 
 ```bash
 cp config/config.example.json config/config.json
+cp config/members.example.json config/members.json
 ```
 
-编辑 `config/config.json`：
+编辑 `config/config.json`，填写账号、接口和存储配置：
 
 ```json
 {
@@ -64,13 +65,6 @@ cp config/config.example.json config/config.json
     "pa": "抓包得到的pa请求头",
     "pSignType": "V0"
   },
-  "members": [
-    {
-      "name": "成员名字",
-      "serverId": 951577,
-      "channelId": 1312655
-    }
-  ],
   "storage": {
     "type": "mysql",
     "host": "localhost",
@@ -84,6 +78,18 @@ cp config/config.example.json config/config.json
 }
 ```
 
+编辑 `config/members.json`，单独维护成员列表：
+
+```json
+[
+  {
+    "name": "成员名字",
+    "serverId": 951577,
+    "channelId": 1312655
+  }
+]
+```
+
 ### 3. 安装依赖
 
 ```bash
@@ -92,12 +98,12 @@ pip install -r requirements.txt
 
 ### 4. 修改代码
 
-根据抓包结果，填充以下关键字段：
+根据抓包结果，填充 `config/config.json` 中的以下关键字段：
 
 1. `encryptedPassword` - 登录接口中的 `loginMobile.pwd`
 2. `pa` - 请求头中的 `pa`
 3. `appInfo` - 请求头中的 `appInfo`
-4. `channelId` / `serverId` - 消息列表接口的请求参数
+成员的 `channelId` / `serverId` 请填写到 `config/members.json`。
 
 ### 5. 运行程序
 
