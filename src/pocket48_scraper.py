@@ -16,7 +16,12 @@ from pathlib import Path
 
 import requests
 
-from message_storage import MessageStorage, create_storage
+from message_storage import (
+    MessageStorage,
+    create_storage,
+    _parse_json_like,
+    _parse_member_role_from_json,
+)
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -188,29 +193,14 @@ class Pocket48Client:
     def _extract_user_from_ext(self, ext_info: str) -> Dict[str, Any]:
         if not ext_info:
             return {}
-        try:
-            data = json.loads(ext_info)
-            return data.get("user", {}) if isinstance(data, dict) else {}
-        except json.JSONDecodeError:
-            return {}
+        parsed = _parse_json_like(ext_info)
+        return parsed.get("user", {}) if isinstance(parsed, dict) else {}
 
     def _is_member_message(self, ext_info: str) -> bool:
         if not ext_info:
             return False
-        try:
-            data = json.loads(ext_info)
-        except json.JSONDecodeError:
-            return False
-
-        if not isinstance(data, dict):
-            return False
-
-        user = data.get("user") if isinstance(data.get("user"), dict) else None
-        if user and user.get("roleId") == 3:
-            return True
-
-        channel_role = data.get("channelRole")
-        return channel_role in (2, "2")
+        parsed = _parse_json_like(ext_info)
+        return _parse_member_role_from_json(parsed)
 
     def login(self) -> bool:
         if self.token_manager.get_token():
@@ -481,14 +471,15 @@ class Pocket48Client:
         interval: int = 60,
         limit: int = 100,
         max_pages: Optional[int] = None,
+        max_retries: int = 5,
     ):
         room_id = str(member.get("channelId"))
         room_name = member.get("name", room_id)
         logger.info("开始监控房间 %s(%s)，间隔 %s 秒", room_name, room_id, interval)
 
+        consecutive_failures = 0
         while True:
             try:
-                # 每轮都从最新页开始，必要时按 nextTime 继续翻页，补齐本地缺失段。
                 messages = self.fetch_incremental_messages(
                     member, limit=limit, max_pages=max_pages
                 )
@@ -508,10 +499,12 @@ class Pocket48Client:
                     logger.info(
                         "房间 %s(%s) 保存了 %s 条新消息", room_name, room_id, saved
                     )
+                    consecutive_failures = 0
                 else:
                     self.storage.record_fetch(
                         room_id=room_id, messages_count=0, status="success"
                     )
+                    consecutive_failures = 0
 
                 time.sleep(interval)
 
@@ -519,14 +512,27 @@ class Pocket48Client:
                 logger.info("停止监控房间 %s(%s)", room_name, room_id)
                 break
             except Exception as exc:
-                logger.error("监控异常 %s(%s): %s", room_name, room_id, exc)
+                consecutive_failures += 1
+                logger.error(
+                    "监控异常 %s(%s) [连续失败 %s/%s]: %s",
+                    room_name,
+                    room_id,
+                    consecutive_failures,
+                    max_retries,
+                    exc,
+                )
                 self.storage.record_fetch(
                     room_id=room_id,
                     messages_count=0,
                     status="failed",
                     error_message=str(exc),
                 )
-                time.sleep(interval * 2)
+                if consecutive_failures >= max_retries:
+                    logger.error(
+                        "房间 %s(%s) 连续失败达到上限，停止监控", room_name, room_id
+                    )
+                    break
+                time.sleep(interval * min(consecutive_failures, 3))
 
 
 class MessageScraper:
@@ -572,6 +578,7 @@ class MessageScraper:
         interval = monitor_config.get("interval", 60)
         limit = monitor_config.get("limit", 100)
         max_pages = monitor_config.get("max_pages")
+        max_retries = monitor_config.get("max_retries", 5)
 
         for member in members:
             if (
@@ -580,7 +587,7 @@ class MessageScraper:
             ):
                 thread = threading.Thread(
                     target=self.client.monitor_room,
-                    args=(member, interval, limit, max_pages),
+                    args=(member, interval, limit, max_pages, max_retries),
                     daemon=True,
                 )
                 thread.start()

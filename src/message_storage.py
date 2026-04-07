@@ -3,13 +3,47 @@ import json
 import logging
 import sqlite3
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import pymysql
 from pymysql.cursors import DictCursor
 
 logger = logging.getLogger(__name__)
+
+MEMBER_ROLE_ID = 3
+MEMBER_CHANNEL_ROLES: Set[Any] = {2, "2"}
+MEMBER_ROLE_ID_KEYS: Set[str] = {"roleId", "channelRole"}
+
+
+def _is_member_role_value(value: Any) -> bool:
+    if value == MEMBER_ROLE_ID:
+        return True
+    if str(value) == "2":
+        return True
+    return False
+
+
+def _parse_member_role_from_json(data: Any) -> bool:
+    if not isinstance(data, dict):
+        return False
+    user = data.get("user")
+    if isinstance(user, dict) and _is_member_role_value(user.get("roleId")):
+        return True
+    if _is_member_role_value(data.get("channelRole")):
+        return True
+    return False
+
+
+def _extract_member_sender_user_id(message: Dict[str, Any]) -> Optional[int]:
+    ext_info = message.get("ext_info")
+    if ext_info is None:
+        return None
+    parsed = _parse_json_like(ext_info)
+    if not _parse_member_role_from_json(parsed):
+        return None
+    return message.get("user_id")
 
 
 def _json_dumps(value: Any) -> Optional[str]:
@@ -110,23 +144,16 @@ def _extract_media_fields(body: Any, ext_info: Any) -> Dict[str, Any]:
     }
 
 
-def _is_member_sender(ext_info: Any) -> bool:
-    parsed = _parse_json_like(ext_info)
-    if not isinstance(parsed, dict):
-        return False
-
-    user = parsed.get("user") if isinstance(parsed.get("user"), dict) else None
-    if user and user.get("roleId") == 3:
-        return True
-
-    channel_role = parsed.get("channelRole")
-    return channel_role in (2, "2")
-
-
-def _extract_member_sender_user_id(message: Dict[str, Any]) -> Optional[Any]:
-    if _is_member_sender(message.get("ext_info")):
-        return message.get("user_id")
-    return None
+def _determine_sender_role(ext_info_str: str) -> str:
+    if not ext_info_str:
+        return "fan"
+    if (
+        '"roleId": 3' in ext_info_str
+        or '"channelRole": "2"' in ext_info_str
+        or '"channelRole": 2' in ext_info_str
+    ):
+        return "member"
+    return "fan"
 
 
 def _timestamp_ms_to_datetime(value: Any) -> datetime:
@@ -294,6 +321,16 @@ class SQLiteStorage(MessageStorage):
         try:
             conn = self._connect()
             cursor = conn.cursor()
+            message_ids = [msg.get("message_id") for msg in messages]
+            existing_before: set = set()
+            if message_ids:
+                placeholders = ", ".join(["?"] * len(message_ids))
+                cursor.execute(
+                    f"SELECT message_id FROM messages WHERE message_id IN ({placeholders})",
+                    message_ids,
+                )
+                existing_before = {row[0] for row in cursor.fetchall()}
+
             cursor.executemany(
                 """
                 INSERT OR IGNORE INTO messages
@@ -315,9 +352,14 @@ class SQLiteStorage(MessageStorage):
                 ],
             )
             conn.commit()
-            affected = cursor.rowcount
+
+            cursor.execute(
+                f"SELECT message_id FROM messages WHERE message_id IN ({placeholders})",
+                message_ids,
+            )
+            existing_after = {row[0] for row in cursor.fetchall()}
             conn.close()
-            return max(affected, 0)
+            return len(existing_after - existing_before)
         except Exception as exc:
             logger.error("批量保存消息失败: %s", exc)
             return 0
@@ -572,13 +614,7 @@ class SQLiteStorage(MessageStorage):
                 "message_id": row[1],
                 "user_id": row[2],
                 "username": row[3],
-                "sender_role": "member"
-                if (
-                    '"roleId": 3' in str(row[6])
-                    or '"channelRole": "2"' in str(row[6])
-                    or '"channelRole": 2' in str(row[6])
-                )
-                else "fan",
+                "sender_role": _determine_sender_role(str(row[6])),
                 "content": row[4],
                 "msg_type": row[5],
                 "ext_info": row[6],
@@ -610,13 +646,7 @@ class SQLiteStorage(MessageStorage):
             "message_id": row[1],
             "user_id": row[2],
             "username": row[3],
-            "sender_role": "member"
-            if (
-                '"roleId": 3' in str(row[6])
-                or '"channelRole": "2"' in str(row[6])
-                or '"channelRole": 2' in str(row[6])
-            )
-            else "fan",
+            "sender_role": _determine_sender_role(str(row[6])),
             "content": row[4],
             "msg_type": row[5],
             "ext_info": row[6],
@@ -626,6 +656,10 @@ class SQLiteStorage(MessageStorage):
 
 
 class MySQLStorage(MessageStorage):
+    _pool_size: int = 10
+    _pool: List[pymysql.connections.Connection] = []
+    _pool_lock: Any = None
+
     def __init__(
         self,
         host: str,
@@ -634,6 +668,7 @@ class MySQLStorage(MessageStorage):
         user: str,
         password: str,
         charset: str = "utf8mb4",
+        pool_size: int = 10,
     ):
         self.connection_args = {
             "host": host,
@@ -654,8 +689,54 @@ class MySQLStorage(MessageStorage):
             "cursorclass": DictCursor,
             "autocommit": False,
         }
+        self._pool_size = pool_size
         self._ensure_database()
         self._init_database()
+        self._init_pool()
+
+    @classmethod
+    def _get_pool_lock(cls):
+        if cls._pool_lock is None:
+            import threading
+
+            cls._pool_lock = threading.Lock()
+        return cls._pool_lock
+
+    def _init_pool(self):
+        lock = self._get_pool_lock()
+        with lock:
+            if not MySQLStorage._pool:
+                MySQLStorage._pool = []
+
+    def _get_connection(self) -> pymysql.connections.Connection:
+        lock = self._get_pool_lock()
+        with lock:
+            if MySQLStorage._pool:
+                return MySQLStorage._pool.pop()
+        conn = pymysql.connect(**self.connection_args)
+        return conn
+
+    def _return_connection(self, conn: pymysql.connections.Connection):
+        try:
+            lock = self._get_pool_lock()
+            with lock:
+                if len(MySQLStorage._pool) < self._pool_size:
+                    MySQLStorage._pool.append(conn)
+                    return
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    @contextmanager
+    def _get_conn(self):
+        conn = self._get_connection()
+        try:
+            yield conn
+        finally:
+            self._return_connection(conn)
 
     def _connect(self):
         return pymysql.connect(**self.connection_args)
@@ -791,252 +872,107 @@ class MySQLStorage(MessageStorage):
 
     def _find_member_sender_user_id(
         self, messages: List[Dict[str, Any]]
-    ) -> Optional[Any]:
+    ) -> Optional[int]:
         for message in messages:
             sender_user_id = _extract_member_sender_user_id(message)
             if sender_user_id not in (None, ""):
-                return sender_user_id
+                return int(sender_user_id) if sender_user_id else None
         return None
 
     def backfill_member_sender_user_ids(self) -> int:
-        conn = self._connect()
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT owner_member_id, sender_user_id
-                    FROM messages
-                    WHERE raw_brief LIKE %s OR raw_brief LIKE %s
-                    ORDER BY owner_member_id, message_time_ms DESC
-                    """,
-                    ('%"roleId": 3%', '%"channelRole": "2"%'),
-                )
-                latest_by_member: Dict[Any, Any] = {}
-                for row in cursor.fetchall():
-                    owner_member_id = row["owner_member_id"]
-                    sender_user_id = row["sender_user_id"]
-                    if (
-                        owner_member_id not in latest_by_member
-                        and sender_user_id not in (None, "")
-                    ):
-                        latest_by_member[owner_member_id] = sender_user_id
-
-                updated = 0
-                for owner_member_id, sender_user_id in latest_by_member.items():
-                    updated += cursor.execute(
-                        "UPDATE members SET sender_user_id=%s WHERE id=%s",
-                        (sender_user_id, owner_member_id),
+        with self._get_conn() as conn:
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT owner_member_id, sender_user_id
+                        FROM messages
+                        WHERE raw_brief LIKE %s OR raw_brief LIKE %s
+                        ORDER BY owner_member_id, message_time_ms DESC
+                        """,
+                        ('%"roleId": 3%', '%"channelRole": "2"%'),
                     )
-            conn.commit()
-            return updated
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+                    latest_by_member: Dict[Any, Any] = {}
+                    for row in cursor.fetchall():
+                        owner_member_id = row["owner_member_id"]
+                        sender_user_id = row["sender_user_id"]
+                        if (
+                            owner_member_id not in latest_by_member
+                            and sender_user_id not in (None, "")
+                        ):
+                            latest_by_member[owner_member_id] = sender_user_id
+
+                    updated = 0
+                    for owner_member_id, sender_user_id in latest_by_member.items():
+                        updated += cursor.execute(
+                            "UPDATE members SET sender_user_id=%s WHERE id=%s",
+                            (sender_user_id, owner_member_id),
+                        )
+                conn.commit()
+                return updated
+            except Exception:
+                conn.rollback()
+                raise
 
     def save_message(self, message: Dict[str, Any]) -> bool:
         owner_member_id = message.get("owner_member_id")
         room_id = message.get("room_id")
         if owner_member_id is None or room_id is None:
-            raise ValueError("消息缺少 owner_member_id 或 room_id，无法写入 MySQL")
+            raise ValueError(f"消息缺少 owner_member_id 或 room_id，无法写入 MySQL")
 
-        conn = self._connect()
-        try:
-            with conn.cursor() as cursor:
-                # 先确保成员和房间主数据存在，再落消息正文和扩展载荷。
-                cursor.execute(
-                    """
-                    INSERT INTO members (id, member_name, room_id, sender_user_id)
-                    VALUES (%s, %s, %s, %s)
-                    ON DUPLICATE KEY UPDATE
-                        member_name = VALUES(member_name),
-                        room_id = VALUES(room_id),
-                        sender_user_id = COALESCE(VALUES(sender_user_id), sender_user_id),
-                        updated_at = CURRENT_TIMESTAMP
+        with self._get_conn() as conn:
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO members (id, member_name, room_id, sender_user_id)
+                        VALUES (%s, %s, %s, %s)
+                        ON DUPLICATE KEY UPDATE
+                            member_name = VALUES(member_name),
+                            room_id = VALUES(room_id),
+                            sender_user_id = COALESCE(VALUES(sender_user_id), sender_user_id),
+                            updated_at = CURRENT_TIMESTAMP
                 """,
-                    (
-                        owner_member_id,
-                        message.get("member_name")
-                        or message.get("username")
-                        or str(owner_member_id),
-                        room_id,
-                        _extract_member_sender_user_id(message),
-                    ),
-                )
-                cursor.execute(
-                    """
-                    INSERT INTO rooms (id, owner_member_id, room_name)
-                    VALUES (%s, %s, %s)
-                    ON DUPLICATE KEY UPDATE
-                        owner_member_id = VALUES(owner_member_id),
-                        room_name = VALUES(room_name),
-                        updated_at = CURRENT_TIMESTAMP
-                """,
-                    (
-                        room_id,
-                        owner_member_id,
-                        message.get("member_name") or str(room_id),
-                    ),
-                )
-
-                message_id = str(message.get("message_id") or "")
-                inserted = cursor.execute(
-                    """
-                    INSERT IGNORE INTO messages (
-                        message_id, room_id, sender_user_id, sender_name, owner_member_id,
-                        message_type, sub_type, text_content, message_time, message_time_ms,
-                        is_deleted, raw_brief
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                    (
-                        message_id,
-                        room_id,
-                        message.get("user_id"),
-                        message.get("username"),
-                        owner_member_id,
-                        str(message.get("msg_type") or "UNKNOWN"),
-                        message.get("sub_type"),
-                        _extract_text_content(
-                            message.get("content"), message.get("ext_info")
+                        (
+                            owner_member_id,
+                            message.get("member_name")
+                            or message.get("username")
+                            or str(owner_member_id),
+                            room_id,
+                            _extract_member_sender_user_id(message),
                         ),
-                        _timestamp_ms_to_datetime(message.get("timestamp")),
-                        message.get("timestamp"),
-                        0,
-                        _json_dumps(
-                            {
-                                "body": _parse_json_like(message.get("content")),
-                                "extInfo": _parse_json_like(message.get("ext_info")),
-                            }
-                        ),
-                    ),
-                )
-
-                if inserted:
-                    # 只有消息主表首次写入成功时，才补充 payload 明细，避免重复写放大。
-                    payload = _extract_media_fields(
-                        message.get("content"), message.get("ext_info")
                     )
                     cursor.execute(
                         """
-                        INSERT INTO message_payloads (
-                            message_id, media_url, media_path, media_cover_url, media_duration,
-                            width, height, reply_to_message_id, reply_to_text,
-                            flip_user_name, flip_question, flip_answer, ext_json
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        INSERT INTO rooms (id, owner_member_id, room_name)
+                        VALUES (%s, %s, %s)
                         ON DUPLICATE KEY UPDATE
-                            media_url = VALUES(media_url),
-                            media_cover_url = VALUES(media_cover_url),
-                            media_duration = VALUES(media_duration),
-                            width = VALUES(width),
-                            height = VALUES(height),
-                            reply_to_text = VALUES(reply_to_text),
-                            flip_user_name = VALUES(flip_user_name),
-                            flip_question = VALUES(flip_question),
-                            flip_answer = VALUES(flip_answer),
-                            ext_json = VALUES(ext_json)
-                    """,
+                            owner_member_id = VALUES(owner_member_id),
+                            room_name = VALUES(room_name),
+                            updated_at = CURRENT_TIMESTAMP
+                """,
                         (
-                            message_id,
-                            payload["media_url"],
-                            None,
-                            payload["media_cover_url"],
-                            payload["media_duration"],
-                            payload["width"],
-                            payload["height"],
-                            None,
-                            payload["reply_to_text"],
-                            payload["flip_user_name"],
-                            payload["flip_question"],
-                            payload["flip_answer"],
-                            payload["ext_json"],
+                            room_id,
+                            owner_member_id,
+                            message.get("member_name") or str(room_id),
                         ),
                     )
 
-            conn.commit()
-            return inserted > 0
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
-
-    def save_messages(self, messages: List[Dict[str, Any]]) -> int:
-        if not messages:
-            return 0
-
-        first_message = messages[0]
-        owner_member_id = first_message.get("owner_member_id")
-        room_id = first_message.get("room_id")
-        if owner_member_id is None or room_id is None:
-            raise ValueError("消息缺少 owner_member_id 或 room_id，无法写入 MySQL")
-
-        conn = self._connect()
-        try:
-            with conn.cursor() as cursor:
-                member_sender_user_id = self._find_member_sender_user_id(messages)
-                message_ids = [
-                    str(message.get("message_id") or "") for message in messages
-                ]
-                existing_message_ids: set[str] = set()
-                if message_ids:
-                    placeholders = ", ".join(["%s"] * len(message_ids))
-                    cursor.execute(
-                        f"SELECT message_id FROM messages WHERE message_id IN ({placeholders})",
-                        message_ids,
-                    )
-                    existing_message_ids = {
-                        str(row["message_id"] or "") for row in cursor.fetchall()
-                    }
-                # 批量写入时，成员和房间信息取第一条消息即可，它们在同一房间内应保持一致。
-                cursor.execute(
-                    """
-                    INSERT INTO members (id, member_name, room_id, sender_user_id)
-                    VALUES (%s, %s, %s, %s)
-                    ON DUPLICATE KEY UPDATE
-                        member_name = VALUES(member_name),
-                        room_id = VALUES(room_id),
-                        sender_user_id = COALESCE(VALUES(sender_user_id), sender_user_id),
-                        updated_at = CURRENT_TIMESTAMP
-                """,
-                    (
-                        owner_member_id,
-                        first_message.get("member_name")
-                        or first_message.get("username")
-                        or str(owner_member_id),
-                        room_id,
-                        member_sender_user_id,
-                    ),
-                )
-                cursor.execute(
-                    """
-                    INSERT INTO rooms (id, owner_member_id, room_name)
-                    VALUES (%s, %s, %s)
-                    ON DUPLICATE KEY UPDATE
-                        owner_member_id = VALUES(owner_member_id),
-                        room_name = VALUES(room_name),
-                        updated_at = CURRENT_TIMESTAMP
-                """,
-                    (
-                        room_id,
-                        owner_member_id,
-                        first_message.get("member_name") or str(room_id),
-                    ),
-                )
-
-                message_rows = []
-                payload_rows = []
-                pending_payload_message_ids: set[str] = set()
-                # 先在内存里整理好两张表要写的数据，再分别 executemany，减少往返次数。
-                for message in messages:
                     message_id = str(message.get("message_id") or "")
-                    message_rows.append(
+                    inserted = cursor.execute(
+                        """
+                        INSERT IGNORE INTO messages (
+                            message_id, room_id, sender_user_id, sender_name, owner_member_id,
+                            message_type, sub_type, text_content, message_time, message_time_ms,
+                            is_deleted, raw_brief
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
                         (
                             message_id,
-                            message.get("room_id"),
+                            room_id,
                             message.get("user_id"),
                             message.get("username"),
-                            message.get("owner_member_id"),
+                            owner_member_id,
                             str(message.get("msg_type") or "UNKNOWN"),
                             message.get("sub_type"),
                             _extract_text_content(
@@ -1053,17 +989,32 @@ class MySQLStorage(MessageStorage):
                                     ),
                                 }
                             ),
-                        )
+                        ),
                     )
-                    if (
-                        message_id not in existing_message_ids
-                        and message_id not in pending_payload_message_ids
-                    ):
+
+                    if inserted:
                         payload = _extract_media_fields(
                             message.get("content"), message.get("ext_info")
                         )
-                        pending_payload_message_ids.add(message_id)
-                        payload_rows.append(
+                        cursor.execute(
+                            """
+                            INSERT INTO message_payloads (
+                                message_id, media_url, media_path, media_cover_url, media_duration,
+                                width, height, reply_to_message_id, reply_to_text,
+                                flip_user_name, flip_question, flip_answer, ext_json
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON DUPLICATE KEY UPDATE
+                                media_url = VALUES(media_url),
+                                media_cover_url = VALUES(media_cover_url),
+                                media_duration = VALUES(media_duration),
+                                width = VALUES(width),
+                                height = VALUES(height),
+                                reply_to_text = VALUES(reply_to_text),
+                                flip_user_name = VALUES(flip_user_name),
+                                flip_question = VALUES(flip_question),
+                                flip_answer = VALUES(flip_answer),
+                                ext_json = VALUES(ext_json)
+                        """,
                             (
                                 message_id,
                                 payload["media_url"],
@@ -1078,97 +1029,223 @@ class MySQLStorage(MessageStorage):
                                 payload["flip_question"],
                                 payload["flip_answer"],
                                 payload["ext_json"],
-                            )
+                            ),
                         )
 
-                cursor.executemany(
-                    """
-                    INSERT IGNORE INTO messages (
-                        message_id, room_id, sender_user_id, sender_name, owner_member_id,
-                        message_type, sub_type, text_content, message_time, message_time_ms,
-                        is_deleted, raw_brief
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                    message_rows,
-                )
-                saved_count = max(cursor.rowcount, 0)
+                conn.commit()
+                return inserted > 0
+            except Exception:
+                conn.rollback()
+                raise
 
-                if payload_rows:
-                    cursor.executemany(
+    def save_messages(self, messages: List[Dict[str, Any]]) -> int:
+        if not messages:
+            return 0
+
+        first_message = messages[0]
+        owner_member_id = first_message.get("owner_member_id")
+        room_id = first_message.get("room_id")
+        if owner_member_id is None or room_id is None:
+            raise ValueError(f"消息缺少 owner_member_id 或 room_id，无法写入 MySQL")
+
+        with self._get_conn() as conn:
+            try:
+                with conn.cursor() as cursor:
+                    member_sender_user_id = self._find_member_sender_user_id(messages)
+                    message_ids = [
+                        str(message.get("message_id") or "") for message in messages
+                    ]
+                    existing_message_ids: set[str] = set()
+                    if message_ids:
+                        placeholders = ", ".join(["%s"] * len(message_ids))
+                        cursor.execute(
+                            f"SELECT message_id FROM messages WHERE message_id IN ({placeholders})",
+                            message_ids,
+                        )
+                        existing_message_ids = {
+                            str(row["message_id"] or "") for row in cursor.fetchall()
+                        }
+                    cursor.execute(
                         """
-                        INSERT INTO message_payloads (
-                            message_id, media_url, media_path, media_cover_url, media_duration,
-                            width, height, reply_to_message_id, reply_to_text,
-                            flip_user_name, flip_question, flip_answer, ext_json
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        INSERT INTO members (id, member_name, room_id, sender_user_id)
+                        VALUES (%s, %s, %s, %s)
                         ON DUPLICATE KEY UPDATE
-                            media_url = VALUES(media_url),
-                            media_cover_url = VALUES(media_cover_url),
-                            media_duration = VALUES(media_duration),
-                            width = VALUES(width),
-                            height = VALUES(height),
-                            reply_to_text = VALUES(reply_to_text),
-                            flip_user_name = VALUES(flip_user_name),
-                            flip_question = VALUES(flip_question),
-                            flip_answer = VALUES(flip_answer),
-                            ext_json = VALUES(ext_json)
-                    """,
-                        payload_rows,
+                            member_name = VALUES(member_name),
+                            room_id = VALUES(room_id),
+                            sender_user_id = COALESCE(VALUES(sender_user_id), sender_user_id),
+                            updated_at = CURRENT_TIMESTAMP
+                """,
+                        (
+                            owner_member_id,
+                            first_message.get("member_name")
+                            or first_message.get("username")
+                            or str(owner_member_id),
+                            room_id,
+                            member_sender_user_id,
+                        ),
+                    )
+                    cursor.execute(
+                        """
+                        INSERT INTO rooms (id, owner_member_id, room_name)
+                        VALUES (%s, %s, %s)
+                        ON DUPLICATE KEY UPDATE
+                            owner_member_id = VALUES(owner_member_id),
+                            room_name = VALUES(room_name),
+                            updated_at = CURRENT_TIMESTAMP
+                """,
+                        (
+                            room_id,
+                            owner_member_id,
+                            first_message.get("member_name") or str(room_id),
+                        ),
                     )
 
-            conn.commit()
-            return saved_count
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+                    message_rows = []
+                    payload_rows = []
+                    pending_payload_message_ids: set[str] = set()
+                    for message in messages:
+                        message_id = str(message.get("message_id") or "")
+                        message_rows.append(
+                            (
+                                message_id,
+                                message.get("room_id"),
+                                message.get("user_id"),
+                                message.get("username"),
+                                message.get("owner_member_id"),
+                                str(message.get("msg_type") or "UNKNOWN"),
+                                message.get("sub_type"),
+                                _extract_text_content(
+                                    message.get("content"), message.get("ext_info")
+                                ),
+                                _timestamp_ms_to_datetime(message.get("timestamp")),
+                                message.get("timestamp"),
+                                0,
+                                _json_dumps(
+                                    {
+                                        "body": _parse_json_like(
+                                            message.get("content")
+                                        ),
+                                        "extInfo": _parse_json_like(
+                                            message.get("ext_info")
+                                        ),
+                                    }
+                                ),
+                            )
+                        )
+                        if (
+                            message_id not in existing_message_ids
+                            and message_id not in pending_payload_message_ids
+                        ):
+                            payload = _extract_media_fields(
+                                message.get("content"), message.get("ext_info")
+                            )
+                            pending_payload_message_ids.add(message_id)
+                            payload_rows.append(
+                                (
+                                    message_id,
+                                    payload["media_url"],
+                                    None,
+                                    payload["media_cover_url"],
+                                    payload["media_duration"],
+                                    payload["width"],
+                                    payload["height"],
+                                    None,
+                                    payload["reply_to_text"],
+                                    payload["flip_user_name"],
+                                    payload["flip_question"],
+                                    payload["flip_answer"],
+                                    payload["ext_json"],
+                                )
+                            )
+
+                    cursor.executemany(
+                        """
+                        INSERT IGNORE INTO messages (
+                            message_id, room_id, sender_user_id, sender_name, owner_member_id,
+                            message_type, sub_type, text_content, message_time, message_time_ms,
+                            is_deleted, raw_brief
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                        message_rows,
+                    )
+                    saved_count = max(cursor.rowcount, 0)
+
+                    if payload_rows:
+                        cursor.executemany(
+                            """
+                            INSERT INTO message_payloads (
+                                message_id, media_url, media_path, media_cover_url, media_duration,
+                                width, height, reply_to_message_id, reply_to_text,
+                                flip_user_name, flip_question, flip_answer, ext_json
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON DUPLICATE KEY UPDATE
+                                media_url = VALUES(media_url),
+                                media_cover_url = VALUES(media_cover_url),
+                                media_duration = VALUES(media_duration),
+                                width = VALUES(width),
+                                height = VALUES(height),
+                                reply_to_text = VALUES(reply_to_text),
+                                flip_user_name = VALUES(flip_user_name),
+                                flip_question = VALUES(flip_question),
+                                flip_answer = VALUES(flip_answer),
+                                ext_json = VALUES(ext_json)
+                        """,
+                            payload_rows,
+                        )
+
+                conn.commit()
+                return saved_count
+            except Exception:
+                conn.rollback()
+                raise
 
     def get_messages(self, room_id: str, limit: int = 100) -> List[Dict[str, Any]]:
-        conn = self._connect()
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT
-                        m.room_id,
-                        m.message_id,
-                        m.sender_user_id AS user_id,
-                        m.sender_name AS username,
-                        m.text_content AS content,
-                        m.message_type AS msg_type,
-                        mp.ext_json AS ext_info,
-                        m.message_time_ms AS timestamp,
-                        m.created_at
-                    FROM messages m
-                    LEFT JOIN message_payloads mp ON mp.message_id = m.message_id
-                    WHERE m.room_id = %s
-                    ORDER BY m.message_time DESC
-                    LIMIT %s
-                """,
-                    (room_id, limit),
-                )
-                return list(cursor.fetchall())
-        finally:
-            conn.close()
+        with self._get_conn() as conn:
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT
+                            m.room_id,
+                            m.message_id,
+                            m.sender_user_id AS user_id,
+                            m.sender_name AS username,
+                            m.text_content AS content,
+                            m.message_type AS msg_type,
+                            mp.ext_json AS ext_info,
+                            m.message_time_ms AS timestamp,
+                            m.created_at
+                        FROM messages m
+                        LEFT JOIN message_payloads mp ON mp.message_id = m.message_id
+                        WHERE m.room_id = %s
+                        ORDER BY m.message_time DESC
+                        LIMIT %s
+                    """,
+                        (room_id, limit),
+                    )
+                    return list(cursor.fetchall())
+            except Exception:
+                logger.error("获取房间消息失败 room_id=%s: %s", room_id, exc_info=True)
+                raise
 
     def get_latest_message(self, room_id: str) -> Optional[Dict[str, Any]]:
-        conn = self._connect()
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT message_id, message_time_ms AS timestamp
-                    FROM messages
-                    WHERE room_id = %s
-                    ORDER BY message_time DESC
-                    LIMIT 1
-                """,
-                    (room_id,),
-                )
-                return cursor.fetchone()
-        finally:
-            conn.close()
+        with self._get_conn() as conn:
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT message_id, message_time_ms AS timestamp
+                        FROM messages
+                        WHERE room_id = %s
+                        ORDER BY message_time DESC
+                        LIMIT 1
+                    """,
+                        (room_id,),
+                    )
+                    return cursor.fetchone()
+            except Exception:
+                logger.error("获取最新消息失败 room_id=%s: %s", room_id, exc_info=True)
+                raise
 
     def export_messages(
         self,
@@ -1177,35 +1254,36 @@ class MySQLStorage(MessageStorage):
         limit: Optional[int] = None,
         output_format: str = "json",
     ) -> int:
-        conn = self._connect()
-        try:
-            with conn.cursor() as cursor:
-                query = """
-                    SELECT
-                        m.room_id,
-                        m.message_id,
-                        m.sender_user_id AS user_id,
-                        m.sender_name AS username,
-                        m.text_content AS content,
-                        m.message_type AS msg_type,
-                        mp.ext_json AS ext_info,
-                        m.message_time_ms AS timestamp,
-                        m.created_at
-                    FROM messages m
-                    LEFT JOIN message_payloads mp ON mp.message_id = m.message_id
-                """
-                params: List[Any] = []
-                if room_id:
-                    query += " WHERE m.room_id = %s"
-                    params.append(room_id)
-                query += " ORDER BY m.message_time DESC"
-                if limit is not None:
-                    query += " LIMIT %s"
-                    params.append(limit)
-                cursor.execute(query, params)
-                messages = list(cursor.fetchall())
-        finally:
-            conn.close()
+        with self._get_conn() as conn:
+            try:
+                with conn.cursor() as cursor:
+                    query = """
+                        SELECT
+                            m.room_id,
+                            m.message_id,
+                            m.sender_user_id AS user_id,
+                            m.sender_name AS username,
+                            m.text_content AS content,
+                            m.message_type AS msg_type,
+                            mp.ext_json AS ext_info,
+                            m.message_time_ms AS timestamp,
+                            m.created_at
+                        FROM messages m
+                        LEFT JOIN message_payloads mp ON mp.message_id = m.message_id
+                    """
+                    params: List[Any] = []
+                    if room_id:
+                        query += " WHERE m.room_id = %s"
+                        params.append(room_id)
+                    query += " ORDER BY m.message_time DESC"
+                    if limit is not None:
+                        query += " LIMIT %s"
+                        params.append(limit)
+                    cursor.execute(query, params)
+                    messages = list(cursor.fetchall())
+            except Exception:
+                logger.error("导出消息失败 room_id=%s: %s", room_id, exc_info=True)
+                raise
 
         if output_format == "json":
             with open(output_path, "w", encoding="utf-8") as file:
@@ -1243,70 +1321,76 @@ class MySQLStorage(MessageStorage):
         last_message_id: Optional[str] = None,
         last_message_time_ms: Optional[int] = None,
     ) -> None:
-        conn = self._connect()
-        try:
-            with conn.cursor() as cursor:
-                # crawl_tasks 记录每次抓取执行；成功时再刷新增量检查点，供后续观察状态。
-                cursor.execute(
-                    """
-                    INSERT INTO crawl_tasks (
-                        room_id, task_type, status, start_time_ms, end_time_ms,
-                        last_message_time_ms, error_message
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """,
-                    (
-                        room_id,
-                        "incremental",
-                        status,
-                        int(datetime.now().timestamp() * 1000),
-                        int(datetime.now().timestamp() * 1000),
-                        last_message_time_ms,
-                        error_message,
-                    ),
-                )
-                if status == "success":
+        with self._get_conn() as conn:
+            try:
+                with conn.cursor() as cursor:
                     cursor.execute(
                         """
-                        INSERT INTO crawl_checkpoints (
-                            room_id, last_message_id, last_message_time_ms, last_success_at
-                        ) VALUES (%s, %s, %s, NOW())
-                        ON DUPLICATE KEY UPDATE
-                            last_message_id = COALESCE(VALUES(last_message_id), last_message_id),
-                            last_message_time_ms = COALESCE(VALUES(last_message_time_ms), last_message_time_ms),
-                            last_success_at = VALUES(last_success_at),
-                            updated_at = CURRENT_TIMESTAMP
+                        INSERT INTO crawl_tasks (
+                            room_id, task_type, status, start_time_ms, end_time_ms,
+                            last_message_time_ms, error_message
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
                     """,
-                        (room_id, last_message_id, last_message_time_ms),
+                        (
+                            room_id,
+                            "incremental",
+                            status,
+                            int(datetime.now().timestamp() * 1000),
+                            int(datetime.now().timestamp() * 1000),
+                            last_message_time_ms,
+                            error_message,
+                        ),
                     )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+                    if status == "success":
+                        cursor.execute(
+                            """
+                            INSERT INTO crawl_checkpoints (
+                                room_id, last_message_id, last_message_time_ms, last_success_at
+                            ) VALUES (%s, %s, %s, NOW())
+                            ON DUPLICATE KEY UPDATE
+                                last_message_id = COALESCE(VALUES(last_message_id), last_message_id),
+                                last_message_time_ms = COALESCE(VALUES(last_message_time_ms), last_message_time_ms),
+                                last_success_at = VALUES(last_success_at),
+                                updated_at = CURRENT_TIMESTAMP
+                        """,
+                            (room_id, last_message_id, last_message_time_ms),
+                        )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                logger.error(
+                    "记录抓取状态失败 room_id=%s, status=%s: %s",
+                    room_id,
+                    status,
+                    exc_info=True,
+                )
+                raise
 
     def get_statistics(self) -> Dict[str, Any]:
-        conn = self._connect()
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT COUNT(*) AS cnt FROM messages")
-                total_messages = cursor.fetchone()["cnt"]
-                cursor.execute("SELECT COUNT(DISTINCT room_id) AS cnt FROM messages")
-                total_rooms = cursor.fetchone()["cnt"]
-                cursor.execute(
-                    "SELECT COUNT(*) AS cnt FROM crawl_tasks WHERE status = 'success'"
-                )
-                successful_fetches = cursor.fetchone()["cnt"]
-                cursor.execute("""
-                    SELECT room_id, COUNT(*) AS cnt
-                    FROM messages
-                    GROUP BY room_id
-                    ORDER BY cnt DESC
-                    LIMIT 10
-                """)
-                top_rooms_rows = cursor.fetchall()
-        finally:
-            conn.close()
+        with self._get_conn() as conn:
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT COUNT(*) AS cnt FROM messages")
+                    total_messages = cursor.fetchone()["cnt"]
+                    cursor.execute(
+                        "SELECT COUNT(DISTINCT room_id) AS cnt FROM messages"
+                    )
+                    total_rooms = cursor.fetchone()["cnt"]
+                    cursor.execute(
+                        "SELECT COUNT(*) AS cnt FROM crawl_tasks WHERE status = 'success'"
+                    )
+                    successful_fetches = cursor.fetchone()["cnt"]
+                    cursor.execute("""
+                        SELECT room_id, COUNT(*) AS cnt
+                        FROM messages
+                        GROUP BY room_id
+                        ORDER BY cnt DESC
+                        LIMIT 10
+                    """)
+                    top_rooms_rows = cursor.fetchall()
+            except Exception:
+                logger.error("获取统计信息失败: %s", exc_info=True)
+                raise
 
         return {
             "total_messages": total_messages,
@@ -1316,48 +1400,52 @@ class MySQLStorage(MessageStorage):
         }
 
     def list_rooms(self) -> List[Dict[str, Any]]:
-        conn = self._connect()
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    SELECT
-                        r.id,
-                        COALESCE(r.room_name, CAST(r.id AS CHAR)) AS name,
-                        COUNT(m.message_id) AS message_count,
-                        MAX(m.message_time_ms) AS latest_timestamp
-                    FROM rooms r
-                    LEFT JOIN messages m ON m.room_id = r.id
-                    GROUP BY r.id, r.room_name
-                    ORDER BY latest_timestamp DESC, r.id DESC
-                """)
-                return list(cursor.fetchall())
-        finally:
-            conn.close()
+        with self._get_conn() as conn:
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT
+                            r.id,
+                            COALESCE(r.room_name, CAST(r.id AS CHAR)) AS name,
+                            COUNT(m.message_id) AS message_count,
+                            MAX(m.message_time_ms) AS latest_timestamp
+                        FROM rooms r
+                        LEFT JOIN messages m ON m.room_id = r.id
+                        GROUP BY r.id, r.room_name
+                        ORDER BY latest_timestamp DESC, r.id DESC
+                    """)
+                    return list(cursor.fetchall())
+            except Exception:
+                logger.error("获取房间列表失败: %s", exc_info=True)
+                raise
 
     def list_senders(self, room_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        conn = self._connect()
-        try:
-            with conn.cursor() as cursor:
-                query = """
-                    SELECT
-                        sender_user_id AS user_id,
-                        sender_name AS username,
-                        COUNT(*) AS message_count,
-                        MAX(message_time_ms) AS latest_timestamp
-                    FROM messages
-                """
-                params: List[Any] = []
-                if room_id:
-                    query += " WHERE room_id = %s"
-                    params.append(room_id)
-                query += """
-                    GROUP BY sender_user_id, sender_name
-                    ORDER BY latest_timestamp DESC, username ASC
-                """
-                cursor.execute(query, params)
-                return list(cursor.fetchall())
-        finally:
-            conn.close()
+        with self._get_conn() as conn:
+            try:
+                with conn.cursor() as cursor:
+                    query = """
+                        SELECT
+                            sender_user_id AS user_id,
+                            sender_name AS username,
+                            COUNT(*) AS message_count,
+                            MAX(message_time_ms) AS latest_timestamp
+                        FROM messages
+                    """
+                    params: List[Any] = []
+                    if room_id:
+                        query += " WHERE room_id = %s"
+                        params.append(room_id)
+                    query += """
+                        GROUP BY sender_user_id, sender_name
+                        ORDER BY latest_timestamp DESC, username ASC
+                    """
+                    cursor.execute(query, params)
+                    return list(cursor.fetchall())
+            except Exception:
+                logger.error(
+                    "获取发送者列表失败 room_id=%s: %s", room_id, exc_info=True
+                )
+                raise
 
     def search_messages(
         self,
@@ -1371,182 +1459,206 @@ class MySQLStorage(MessageStorage):
         limit: int = 50,
         offset: int = 0,
     ) -> Dict[str, Any]:
-        conn = self._connect()
-        try:
-            with conn.cursor() as cursor:
-                where_clauses: List[str] = []
-                params: List[Any] = []
+        with self._get_conn() as conn:
+            try:
+                with conn.cursor() as cursor:
+                    where_clauses: List[str] = []
+                    params: List[Any] = []
 
-                if room_id:
-                    where_clauses.append("m.room_id = %s")
-                    params.append(room_id)
-                if sender_keyword:
-                    where_clauses.append(
-                        "(m.sender_name LIKE %s OR CAST(m.sender_user_id AS CHAR) LIKE %s)"
-                    )
-                    like_value = f"%{sender_keyword}%"
-                    params.extend([like_value, like_value])
-                if keyword:
-                    where_clauses.append(
-                        "("
-                        "m.text_content LIKE %s OR "
-                        "m.raw_brief LIKE %s OR "
-                        "mp.ext_json LIKE %s OR "
-                        "mp.flip_question LIKE %s OR "
-                        "mp.flip_answer LIKE %s OR "
-                        "mp.reply_to_text LIKE %s"
-                        ")"
-                    )
-                    like_value = f"%{keyword}%"
-                    params.extend(
-                        [
-                            like_value,
-                            like_value,
-                            like_value,
-                            like_value,
-                            like_value,
-                            like_value,
-                        ]
-                    )
-                if msg_type:
-                    where_clauses.append("m.message_type = %s")
-                    params.append(msg_type)
-                if start_time_ms is not None:
-                    where_clauses.append("m.message_time_ms >= %s")
-                    params.append(start_time_ms)
-                if end_time_ms is not None:
-                    where_clauses.append("m.message_time_ms <= %s")
-                    params.append(end_time_ms)
-                if sender_role == "member":
-                    where_clauses.append(
-                        "(m.raw_brief LIKE %s OR m.raw_brief LIKE %s OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s)"
-                    )
-                    params.extend(
-                        [
-                            '%"roleId": 3%',
-                            '%"channelRole": "2"%',
-                            '%"roleId": 3%',
-                            '%"channelRole": "2"%',
-                        ]
-                    )
-                elif sender_role == "fan":
-                    where_clauses.append(
-                        "NOT (m.raw_brief LIKE %s OR m.raw_brief LIKE %s OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s)"
-                    )
-                    params.extend(
-                        [
-                            '%"roleId": 3%',
-                            '%"channelRole": "2"%',
-                            '%"roleId": 3%',
-                            '%"channelRole": "2"%',
-                        ]
-                    )
+                    if room_id:
+                        where_clauses.append("m.room_id = %s")
+                        params.append(room_id)
+                    if sender_keyword:
+                        where_clauses.append(
+                            "(m.sender_name LIKE %s OR CAST(m.sender_user_id AS CHAR) LIKE %s)"
+                        )
+                        like_value = f"%{sender_keyword}%"
+                        params.extend([like_value, like_value])
+                    if keyword:
+                        where_clauses.append(
+                            "("
+                            "m.text_content LIKE %s OR "
+                            "m.raw_brief LIKE %s OR "
+                            "mp.ext_json LIKE %s OR "
+                            "mp.flip_question LIKE %s OR "
+                            "mp.flip_answer LIKE %s OR "
+                            "mp.reply_to_text LIKE %s"
+                            ")"
+                        )
+                        like_value = f"%{keyword}%"
+                        params.extend(
+                            [
+                                like_value,
+                                like_value,
+                                like_value,
+                                like_value,
+                                like_value,
+                                like_value,
+                            ]
+                        )
+                    if msg_type:
+                        where_clauses.append("m.message_type = %s")
+                        params.append(msg_type)
+                    if start_time_ms is not None:
+                        where_clauses.append("m.message_time_ms >= %s")
+                        params.append(start_time_ms)
+                    if end_time_ms is not None:
+                        where_clauses.append("m.message_time_ms <= %s")
+                        params.append(end_time_ms)
+                    if sender_role == "member":
+                        where_clauses.append(
+                            "(m.raw_brief LIKE %s OR m.raw_brief LIKE %s OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s)"
+                        )
+                        params.extend(
+                            [
+                                '%"roleId": 3%',
+                                '%"channelRole": "2"%',
+                                '%"roleId": 3%',
+                                '%"channelRole": "2"%',
+                            ]
+                        )
+                    elif sender_role == "fan":
+                        where_clauses.append(
+                            "NOT (m.raw_brief LIKE %s OR m.raw_brief LIKE %s OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s)"
+                        )
+                        params.extend(
+                            [
+                                '%"roleId": 3%',
+                                '%"channelRole": "2"%',
+                                '%"roleId": 3%',
+                                '%"channelRole": "2"%',
+                            ]
+                        )
 
-                where_sql = (
-                    f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
-                )
-                count_query = (
-                    "SELECT COUNT(*) AS cnt FROM messages m "
-                    "LEFT JOIN message_payloads mp ON mp.message_id = m.message_id"
-                    f"{where_sql}"
-                )
-                cursor.execute(count_query, params)
-                total = cursor.fetchone()["cnt"]
+                    where_sql = (
+                        f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+                    )
+                    count_query = (
+                        "SELECT COUNT(*) AS cnt FROM messages m "
+                        "LEFT JOIN message_payloads mp ON mp.message_id = m.message_id"
+                        f"{where_sql}"
+                    )
+                    cursor.execute(count_query, params)
+                    total = cursor.fetchone()["cnt"]
 
-                data_query = (
-                    """
-                    SELECT
-                        m.room_id,
-                        COALESCE(r.room_name, CAST(m.room_id AS CHAR)) AS room_name,
-                        m.message_id,
-                        m.sender_user_id AS user_id,
-                        m.sender_name AS username,
-                        CASE
-                            WHEN m.raw_brief LIKE '%%\"roleId\": 3%%'
-                                 OR m.raw_brief LIKE '%%\"channelRole\": \"2\"%%'
-                                 OR mp.ext_json LIKE '%%\"roleId\": 3%%'
-                                 OR mp.ext_json LIKE '%%\"channelRole\": \"2\"%%'
-                            THEN 'member'
-                            ELSE 'fan'
-                        END AS sender_role,
-                        m.text_content AS content,
-                        m.message_type AS msg_type,
-                        mp.ext_json AS ext_info,
-                        m.message_time_ms AS timestamp,
-                        m.created_at,
-                        mp.media_url,
-                        mp.media_cover_url,
-                        mp.reply_to_text,
-                        mp.flip_question,
-                        mp.flip_answer
-                    FROM messages m
-                    LEFT JOIN rooms r ON r.id = m.room_id
-                    LEFT JOIN message_payloads mp ON mp.message_id = m.message_id
-                    """
-                    f"{where_sql}"
-                    " ORDER BY m.message_time DESC, m.message_id DESC LIMIT %s OFFSET %s"
-                )
-                cursor.execute(data_query, params + [limit, offset])
-                items = list(cursor.fetchall())
-                return {"total": total, "items": items}
-        finally:
-            conn.close()
+                    data_query = (
+                        """
+                        SELECT
+                            m.room_id,
+                            COALESCE(r.room_name, CAST(m.room_id AS CHAR)) AS room_name,
+                            m.message_id,
+                            m.sender_user_id AS user_id,
+                            m.sender_name AS username,
+                            CASE
+                                WHEN m.raw_brief LIKE '%%\"roleId\": 3%%'
+                                     OR m.raw_brief LIKE '%%\"channelRole\": \"2\"%%'
+                                     OR mp.ext_json LIKE '%%\"roleId\": 3%%'
+                                     OR mp.ext_json LIKE '%%\"channelRole\": \"2\"%%'
+                                THEN 'member'
+                                ELSE 'fan'
+                            END AS sender_role,
+                            m.text_content AS content,
+                            m.message_type AS msg_type,
+                            mp.ext_json AS ext_info,
+                            m.message_time_ms AS timestamp,
+                            m.created_at,
+                            mp.media_url,
+                            mp.media_cover_url,
+                            mp.reply_to_text,
+                            mp.flip_question,
+                            mp.flip_answer
+                        FROM messages m
+                        LEFT JOIN rooms r ON r.id = m.room_id
+                        LEFT JOIN message_payloads mp ON mp.message_id = m.message_id
+                        """
+                        f"{where_sql}"
+                        " ORDER BY m.message_time DESC, m.message_id DESC LIMIT %s OFFSET %s"
+                    )
+                    cursor.execute(data_query, params + [limit, offset])
+                    items = list(cursor.fetchall())
+                    return {"total": total, "items": items}
+            except Exception:
+                logger.error("搜索消息失败: %s", exc_info=True)
+                raise
 
     def get_message_detail(self, message_id: str) -> Optional[Dict[str, Any]]:
-        conn = self._connect()
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT
-                        m.room_id,
-                        COALESCE(r.room_name, CAST(m.room_id AS CHAR)) AS room_name,
-                        m.message_id,
-                        m.sender_user_id AS user_id,
-                        m.sender_name AS username,
-                        m.owner_member_id,
-                        CASE
-                            WHEN m.raw_brief LIKE '%%\"roleId\": 3%%'
-                                 OR m.raw_brief LIKE '%%\"channelRole\": \"2\"%%'
-                                 OR mp.ext_json LIKE '%%\"roleId\": 3%%'
-                                 OR mp.ext_json LIKE '%%\"channelRole\": \"2\"%%'
-                            THEN 'member'
-                            ELSE 'fan'
-                        END AS sender_role,
-                        m.message_type AS msg_type,
-                        m.sub_type,
-                        m.text_content AS content,
-                        m.raw_brief,
-                        m.message_time,
-                        m.message_time_ms AS timestamp,
-                        m.created_at,
-                        mp.media_url,
-                        mp.media_cover_url,
-                        mp.media_duration,
-                        mp.width,
-                        mp.height,
-                        mp.reply_to_text,
-                        mp.flip_user_name,
-                        mp.flip_question,
-                        mp.flip_answer,
-                        mp.ext_json AS ext_info
-                    FROM messages m
-                    LEFT JOIN rooms r ON r.id = m.room_id
-                    LEFT JOIN message_payloads mp ON mp.message_id = m.message_id
-                    WHERE m.message_id = %s
-                    LIMIT 1
-                """,
-                    (message_id,),
+        with self._get_conn() as conn:
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT
+                            m.room_id,
+                            COALESCE(r.room_name, CAST(m.room_id AS CHAR)) AS room_name,
+                            m.message_id,
+                            m.sender_user_id AS user_id,
+                            m.sender_name AS username,
+                            m.owner_member_id,
+                            CASE
+                                WHEN m.raw_brief LIKE '%%\"roleId\": 3%%'
+                                     OR m.raw_brief LIKE '%%\"channelRole\": \"2\"%%'
+                                     OR mp.ext_json LIKE '%%\"roleId\": 3%%'
+                                     OR mp.ext_json LIKE '%%\"channelRole\": \"2\"%%'
+                                THEN 'member'
+                                ELSE 'fan'
+                            END AS sender_role,
+                            m.message_type AS msg_type,
+                            m.sub_type,
+                            m.text_content AS content,
+                            m.raw_brief,
+                            m.message_time,
+                            m.message_time_ms AS timestamp,
+                            m.created_at,
+                            mp.media_url,
+                            mp.media_cover_url,
+                            mp.media_duration,
+                            mp.width,
+                            mp.height,
+                            mp.reply_to_text,
+                            mp.flip_user_name,
+                            mp.flip_question,
+                            mp.flip_answer,
+                            mp.ext_json AS ext_info
+                        FROM messages m
+                        LEFT JOIN rooms r ON r.id = m.room_id
+                        LEFT JOIN message_payloads mp ON mp.message_id = m.message_id
+                        WHERE m.message_id = %s
+                        LIMIT 1
+                    """,
+                        (message_id,),
+                    )
+                    return cursor.fetchone()
+            except Exception:
+                logger.error(
+                    "获取消息详情失败 message_id=%s: %s", message_id, exc_info=True
                 )
-                return cursor.fetchone()
-        finally:
-            conn.close()
+                raise
+
+
+class StorageConfigError(ValueError):
+    pass
+
+
+def _validate_storage_config(storage_config: Dict[str, Any], storage_type: str) -> None:
+    errors: List[str] = []
+    if storage_type == "mysql":
+        if not storage_config.get("database"):
+            errors.append("database (MySQL database name) is required")
+        if not storage_config.get("user"):
+            errors.append("user (MySQL user) is required")
+        if not storage_config.get("password"):
+            errors.append("password (MySQL password) is required")
+        if not storage_config.get("host"):
+            errors.append("host (MySQL host) is required")
+    if errors:
+        raise StorageConfigError(f"Invalid storage config: {', '.join(errors)}")
 
 
 def create_storage(config: Dict[str, Any]) -> MessageStorage:
     """按配置选择具体存储实现。"""
     storage_config = config.get("storage", {})
     storage_type = storage_config.get("type", "mysql")
+    _validate_storage_config(storage_config, storage_type)
     if storage_type == "sqlite":
         return SQLiteStorage(storage_config.get("database", "data/messages.db"))
     if storage_type == "mysql":
@@ -1557,5 +1669,6 @@ def create_storage(config: Dict[str, Any]) -> MessageStorage:
             user=storage_config["user"],
             password=storage_config["password"],
             charset=storage_config.get("charset", "utf8mb4"),
+            pool_size=storage_config.get("pool_size", 10),
         )
     raise ValueError(f"不支持的存储类型: {storage_type}")
