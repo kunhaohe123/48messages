@@ -146,6 +146,23 @@ python src/pocket48_scraper.py -c config/config.json --export-format csv --outpu
 python src/pocket48_scraper.py -c config/config.json --export-format json --output data/latest.json --room-id 1312655 --limit 20
 ```
 
+### 7. 启动消息查看后台
+
+项目已经提供一个轻量 Web 页面，用来查看数据库里已抓取的成员消息。
+
+```bash
+python src/message_viewer.py -c config/config.json --host 127.0.0.1 --port 8000
+```
+
+打开 `http://127.0.0.1:8000` 后可以：
+
+- 按房间筛选消息
+- 按成员昵称 / 用户 ID 搜索
+- 按关键词搜索消息内容和扩展字段
+- 查看单条消息详情
+
+注意：这个页面直接读取当前配置对应的数据库，请自行做好访问控制，不要直接暴露到公网。
+
 ## 重要提示
 
 ⚠️ **仅供学习研究使用，请遵守口袋48用户协议**
