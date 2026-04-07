@@ -1026,6 +1026,7 @@ class MySQLStorage(MessageStorage):
 
                 message_rows = []
                 payload_rows = []
+                pending_payload_message_ids: set[str] = set()
                 # 先在内存里整理好两张表要写的数据，再分别 executemany，减少往返次数。
                 for message in messages:
                     message_id = str(message.get("message_id") or "")
@@ -1054,10 +1055,14 @@ class MySQLStorage(MessageStorage):
                             ),
                         )
                     )
-                    if message_id not in existing_message_ids:
+                    if (
+                        message_id not in existing_message_ids
+                        and message_id not in pending_payload_message_ids
+                    ):
                         payload = _extract_media_fields(
                             message.get("content"), message.get("ext_info")
                         )
+                        pending_payload_message_ids.add(message_id)
                         payload_rows.append(
                             (
                                 message_id,
@@ -1096,6 +1101,17 @@ class MySQLStorage(MessageStorage):
                             width, height, reply_to_message_id, reply_to_text,
                             flip_user_name, flip_question, flip_answer, ext_json
                         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON DUPLICATE KEY UPDATE
+                            media_url = VALUES(media_url),
+                            media_cover_url = VALUES(media_cover_url),
+                            media_duration = VALUES(media_duration),
+                            width = VALUES(width),
+                            height = VALUES(height),
+                            reply_to_text = VALUES(reply_to_text),
+                            flip_user_name = VALUES(flip_user_name),
+                            flip_question = VALUES(flip_question),
+                            flip_answer = VALUES(flip_answer),
+                            ext_json = VALUES(ext_json)
                     """,
                         payload_rows,
                     )

@@ -179,6 +179,69 @@ python src/message_viewer.py -c config/config.json --host 127.0.0.1 --port 8000
 
 注意：这个页面直接读取当前配置对应的数据库，请自行做好访问控制，不要直接暴露到公网。
 
+### 8. 服务器部署与维护
+
+当前推荐的线上部署结构：
+
+- `48messages-scraper`：持续抓取服务，systemd 开机自启
+- `48messages-viewer`：消息查看页面，systemd 开机自启
+- `nginx`：对外提供 `80` 端口并反代到 `127.0.0.1:8000`
+- Python 虚拟环境：`/opt/48messages-venv`
+
+常用维护命令：
+
+```bash
+# 查看服务状态
+systemctl status 48messages-scraper
+systemctl status 48messages-viewer
+systemctl status nginx
+
+# 查看实时日志
+journalctl -u 48messages-scraper -f
+journalctl -u 48messages-viewer -f
+
+# 重启服务
+systemctl restart 48messages-scraper
+systemctl restart 48messages-viewer
+systemctl restart nginx
+
+# 停止服务
+systemctl stop 48messages-scraper
+systemctl stop 48messages-viewer
+
+# 启动服务
+systemctl start 48messages-scraper
+systemctl start 48messages-viewer
+
+# 检查 nginx 配置并重载
+nginx -t
+systemctl reload nginx
+```
+
+常用排查命令：
+
+```bash
+# 查看 80 和 8000 端口监听
+ss -lntp | grep -E ':80|:8000'
+
+# 测试本机 viewer 和 nginx 是否正常
+curl -I http://127.0.0.1:8000/
+curl -I http://127.0.0.1/
+
+# 查看抓取统计
+cd /opt/48messages
+/opt/48messages-venv/bin/python src/pocket48_scraper.py -c config/config.json --stats
+
+# 更新服务器依赖
+/opt/48messages-venv/bin/pip install -r /opt/48messages/requirements.txt
+```
+
+HTTPS 说明：
+
+- 如果要配置浏览器信任的 HTTPS，建议先准备一个域名，并把域名解析到服务器公网 IP
+- 直接对公网 IP 配正式 HTTPS 证书通常不可行，最多只能使用自签名证书
+- 域名准备好后，可再接入 Let's Encrypt + Nginx
+
 ## 重要提示
 
 ⚠️ **仅供学习研究使用，请遵守口袋48用户协议**
