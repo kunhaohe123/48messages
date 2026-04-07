@@ -113,6 +113,12 @@ python src/pocket48_scraper.py -c config/config.json
 python src/pocket48_scraper.py -c config/config.json --once
 ```
 
+只抓最近 2 天，并限制最多翻 20 页：
+
+```bash
+python src/pocket48_scraper.py -c config/config.json --once --since-days 2 --max-pages 20
+```
+
 查看统计：
 
 ```bash
@@ -125,6 +131,9 @@ python src/pocket48_scraper.py -c config/config.json --stats
 - 抓取时只保留成员本人发送的消息，粉丝消息会在入库前过滤掉
 - 如果本地最新消息还没有追上接口返回的数据边界，程序会继续使用返回的 `nextTime` 向历史翻页
 - 分页会持续到命中本地已保存的最新消息，或接口没有更多历史页为止
+- 如果某个房间本地还没有历史数据，且你没有显式传入 `--since-days`，脚本默认只回溯最近 30 天
+- 如果你希望手动限制范围，可以传 `--since-days`，例如 `--since-days 2` 表示只抓最近 2 天
+- 如果你希望限制单次执行的翻页深度，可以传 `--max-pages`，例如 `--max-pages 20` 表示最多翻 20 页
 - 这比只抓单页更适合持久化增量抓取，但是否绝对不漏仍取决于服务端分页与接口稳定性
 
 ### 6. 导出已抓取消息

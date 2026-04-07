@@ -90,24 +90,6 @@ def _extract_media_fields(body: Any, ext_info: Any) -> Dict[str, Any]:
         "extInfo": _parse_json_like(ext_info),
     }
 
-
-def _is_member_sender(ext_info: Any) -> bool:
-    parsed = _parse_json_like(ext_info)
-    if not isinstance(parsed, dict):
-        return False
-
-    user = parsed.get("user") if isinstance(parsed.get("user"), dict) else None
-    if user and user.get("roleId") == 3:
-        return True
-
-    channel_role = parsed.get("channelRole")
-    return channel_role in (2, "2")
-
-
-def _extract_member_sender_user_id(message: Dict[str, Any]) -> Optional[Any]:
-    if _is_member_sender(message.get("ext_info")):
-        return message.get("user_id")
-    return None
     return {
         "media_url": _find_first_value(
             merged, {"url", "playUrl", "streamPath", "coverPath"}
@@ -126,6 +108,25 @@ def _extract_member_sender_user_id(message: Dict[str, Any]) -> Optional[Any]:
         ),
         "ext_json": _json_dumps(merged),
     }
+
+
+def _is_member_sender(ext_info: Any) -> bool:
+    parsed = _parse_json_like(ext_info)
+    if not isinstance(parsed, dict):
+        return False
+
+    user = parsed.get("user") if isinstance(parsed.get("user"), dict) else None
+    if user and user.get("roleId") == 3:
+        return True
+
+    channel_role = parsed.get("channelRole")
+    return channel_role in (2, "2")
+
+
+def _extract_member_sender_user_id(message: Dict[str, Any]) -> Optional[Any]:
+    if _is_member_sender(message.get("ext_info")):
+        return message.get("user_id")
+    return None
 
 
 def _timestamp_ms_to_datetime(value: Any) -> datetime:
@@ -644,9 +645,149 @@ class MySQLStorage(MessageStorage):
             "cursorclass": DictCursor,
             "autocommit": False,
         }
+        self._server_connection_args = {
+            "host": host,
+            "port": int(port),
+            "user": user,
+            "password": password,
+            "charset": charset,
+            "cursorclass": DictCursor,
+            "autocommit": False,
+        }
+        self._ensure_database()
+        self._init_database()
 
     def _connect(self):
         return pymysql.connect(**self.connection_args)
+
+    def _connect_server(self):
+        return pymysql.connect(**self._server_connection_args)
+
+    def _ensure_database(self):
+        database_name = self.connection_args["database"]
+        conn = self._connect_server()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"CREATE DATABASE IF NOT EXISTS `{database_name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _init_database(self):
+        conn = self._connect()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS members (
+                        id BIGINT PRIMARY KEY,
+                        member_name VARCHAR(255) NOT NULL,
+                        room_id BIGINT NOT NULL,
+                        sender_user_id BIGINT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        KEY idx_members_room_id (room_id),
+                        KEY idx_members_sender_user_id (sender_user_id)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS rooms (
+                        id BIGINT PRIMARY KEY,
+                        owner_member_id BIGINT NOT NULL,
+                        room_name VARCHAR(255) NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        KEY idx_rooms_owner_member_id (owner_member_id)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS messages (
+                        message_id VARCHAR(128) PRIMARY KEY,
+                        room_id BIGINT NOT NULL,
+                        sender_user_id BIGINT NULL,
+                        sender_name VARCHAR(255) NULL,
+                        owner_member_id BIGINT NOT NULL,
+                        message_type VARCHAR(64) NOT NULL,
+                        sub_type VARCHAR(64) NULL,
+                        text_content LONGTEXT NULL,
+                        message_time DATETIME NOT NULL,
+                        message_time_ms BIGINT NOT NULL,
+                        is_deleted TINYINT(1) NOT NULL DEFAULT 0,
+                        raw_brief LONGTEXT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        KEY idx_messages_room_time (room_id, message_time),
+                        KEY idx_messages_owner_time (owner_member_id, message_time),
+                        KEY idx_messages_sender_user_id (sender_user_id),
+                        KEY idx_messages_message_time_ms (message_time_ms)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS message_payloads (
+                        message_id VARCHAR(128) PRIMARY KEY,
+                        media_url TEXT NULL,
+                        media_path TEXT NULL,
+                        media_cover_url TEXT NULL,
+                        media_duration BIGINT NULL,
+                        width INT NULL,
+                        height INT NULL,
+                        reply_to_message_id VARCHAR(128) NULL,
+                        reply_to_text LONGTEXT NULL,
+                        flip_user_name VARCHAR(255) NULL,
+                        flip_question LONGTEXT NULL,
+                        flip_answer LONGTEXT NULL,
+                        ext_json LONGTEXT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS crawl_tasks (
+                        id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                        room_id BIGINT NOT NULL,
+                        task_type VARCHAR(32) NOT NULL,
+                        status VARCHAR(32) NOT NULL,
+                        start_time_ms BIGINT NOT NULL,
+                        end_time_ms BIGINT NOT NULL,
+                        last_message_time_ms BIGINT NULL,
+                        error_message TEXT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        KEY idx_crawl_tasks_room_id (room_id),
+                        KEY idx_crawl_tasks_status (status),
+                        KEY idx_crawl_tasks_last_message_time_ms (last_message_time_ms)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS crawl_checkpoints (
+                        room_id BIGINT PRIMARY KEY,
+                        last_message_id VARCHAR(128) NULL,
+                        last_message_time_ms BIGINT NULL,
+                        last_success_at DATETIME NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        KEY idx_crawl_checkpoints_last_message_time_ms (last_message_time_ms)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                    """
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def _find_member_sender_user_id(
         self, messages: List[Dict[str, Any]]
@@ -834,6 +975,19 @@ class MySQLStorage(MessageStorage):
         try:
             with conn.cursor() as cursor:
                 member_sender_user_id = self._find_member_sender_user_id(messages)
+                message_ids = [
+                    str(message.get("message_id") or "") for message in messages
+                ]
+                existing_message_ids: set[str] = set()
+                if message_ids:
+                    placeholders = ", ".join(["%s"] * len(message_ids))
+                    cursor.execute(
+                        f"SELECT message_id FROM messages WHERE message_id IN ({placeholders})",
+                        message_ids,
+                    )
+                    existing_message_ids = {
+                        str(row["message_id"] or "") for row in cursor.fetchall()
+                    }
                 # 批量写入时，成员和房间信息取第一条消息即可，它们在同一房间内应保持一致。
                 cursor.execute(
                     """
@@ -900,26 +1054,27 @@ class MySQLStorage(MessageStorage):
                             ),
                         )
                     )
-                    payload = _extract_media_fields(
-                        message.get("content"), message.get("ext_info")
-                    )
-                    payload_rows.append(
-                        (
-                            message_id,
-                            payload["media_url"],
-                            None,
-                            payload["media_cover_url"],
-                            payload["media_duration"],
-                            payload["width"],
-                            payload["height"],
-                            None,
-                            payload["reply_to_text"],
-                            payload["flip_user_name"],
-                            payload["flip_question"],
-                            payload["flip_answer"],
-                            payload["ext_json"],
+                    if message_id not in existing_message_ids:
+                        payload = _extract_media_fields(
+                            message.get("content"), message.get("ext_info")
                         )
-                    )
+                        payload_rows.append(
+                            (
+                                message_id,
+                                payload["media_url"],
+                                None,
+                                payload["media_cover_url"],
+                                payload["media_duration"],
+                                payload["width"],
+                                payload["height"],
+                                None,
+                                payload["reply_to_text"],
+                                payload["flip_user_name"],
+                                payload["flip_question"],
+                                payload["flip_answer"],
+                                payload["ext_json"],
+                            )
+                        )
 
                 cursor.executemany(
                     """
@@ -933,27 +1088,17 @@ class MySQLStorage(MessageStorage):
                 )
                 saved_count = max(cursor.rowcount, 0)
 
-                cursor.executemany(
-                    """
-                    INSERT INTO message_payloads (
-                        message_id, media_url, media_path, media_cover_url, media_duration,
-                        width, height, reply_to_message_id, reply_to_text,
-                        flip_user_name, flip_question, flip_answer, ext_json
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON DUPLICATE KEY UPDATE
-                        media_url = VALUES(media_url),
-                        media_cover_url = VALUES(media_cover_url),
-                        media_duration = VALUES(media_duration),
-                        width = VALUES(width),
-                        height = VALUES(height),
-                        reply_to_text = VALUES(reply_to_text),
-                        flip_user_name = VALUES(flip_user_name),
-                        flip_question = VALUES(flip_question),
-                        flip_answer = VALUES(flip_answer),
-                        ext_json = VALUES(ext_json)
-                """,
-                    payload_rows,
-                )
+                if payload_rows:
+                    cursor.executemany(
+                        """
+                        INSERT INTO message_payloads (
+                            message_id, media_url, media_path, media_cover_url, media_duration,
+                            width, height, reply_to_message_id, reply_to_text,
+                            flip_user_name, flip_question, flip_answer, ext_json
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                        payload_rows,
+                    )
 
             conn.commit()
             return saved_count
@@ -1110,8 +1255,8 @@ class MySQLStorage(MessageStorage):
                             room_id, last_message_id, last_message_time_ms, last_success_at
                         ) VALUES (%s, %s, %s, NOW())
                         ON DUPLICATE KEY UPDATE
-                            last_message_id = VALUES(last_message_id),
-                            last_message_time_ms = VALUES(last_message_time_ms),
+                            last_message_id = COALESCE(VALUES(last_message_id), last_message_id),
+                            last_message_time_ms = COALESCE(VALUES(last_message_time_ms), last_message_time_ms),
                             last_success_at = VALUES(last_success_at),
                             updated_at = CURRENT_TIMESTAMP
                     """,
