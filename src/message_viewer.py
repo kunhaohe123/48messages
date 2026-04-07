@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from math import ceil
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import urlencode
 
 from flask import Flask, abort, request
 
@@ -39,19 +40,20 @@ def pretty_json(value: Any) -> str:
 def parse_datetime_local(value: str, is_end: bool = False) -> Optional[int]:
     if not value:
         return None
-    dt = datetime.fromisoformat(value)
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
     if len(value) == 10 and is_end:
         dt = dt + timedelta(days=1) - timedelta(milliseconds=1)
     return int(dt.timestamp() * 1000)
 
 
 def build_query_string(params: Dict[str, Any]) -> str:
-    pairs = [
-        f"{key}={html.escape(str(value), quote=True)}"
-        for key, value in params.items()
-        if value not in ("", None)
-    ]
-    return f"&{'&'.join(pairs)}" if pairs else ""
+    pairs = {
+        key: str(value) for key, value in params.items() if value not in ("", None)
+    }
+    return f"&{urlencode(pairs)}" if pairs else ""
 
 
 def render_layout(title: str, body: str) -> str:
@@ -96,7 +98,6 @@ def render_layout(title: str, body: str) -> str:
     .cell-type {{ width: 110px; }}
     .cell-time {{ width: 220px; white-space: nowrap; }}
     .content {{ width: 100%; white-space: pre-wrap; word-break: break-word; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; position: relative; line-height: 1.5; }}
-    .content:hover {{ overflow: visible; -webkit-line-clamp: unset; background: rgba(15, 23, 42, 0.5); padding: 8px; border-radius: 8px; z-index: 1; }}
     .content-truncated {{ cursor: pointer; color: #94a3b8; font-size: 12px; margin-top: 4px; }}
     .badge {{ display: inline-block; padding: 4px 8px; background: #1e293b; border: 1px solid #334155; border-radius: 999px; font-size: 12px; font-weight: 500; }}
     .badge-member {{ background: #3b0764; border-color: #7c3aed; color: #f5d0fe; }}

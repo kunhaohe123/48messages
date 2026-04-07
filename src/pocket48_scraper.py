@@ -183,12 +183,8 @@ class Pocket48Client:
             return True
 
         latest_timestamp = latest_local.get("timestamp") or 0
-        latest_message_id = latest_local.get("message_id")
         message_timestamp = message.get("timestamp") or 0
-        message_id = message.get("message_id")
-        return message_timestamp > latest_timestamp or (
-            message_timestamp == latest_timestamp and message_id != latest_message_id
-        )
+        return message_timestamp > latest_timestamp
 
     def _extract_user_from_ext(self, ext_info: str) -> Dict[str, Any]:
         if not ext_info:

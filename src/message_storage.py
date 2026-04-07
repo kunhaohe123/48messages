@@ -887,10 +887,10 @@ class MySQLStorage(MessageStorage):
                         """
                         SELECT owner_member_id, sender_user_id
                         FROM messages
-                        WHERE raw_brief LIKE %s OR raw_brief LIKE %s
+                        WHERE raw_brief LIKE %s OR raw_brief LIKE %s OR raw_brief LIKE %s
                         ORDER BY owner_member_id, message_time_ms DESC
                         """,
-                        ('%"roleId": 3%', '%"channelRole": "2"%'),
+                        ('%"roleId": 3%', '%"channelRole": "2"%', '%"channelRole": 2%'),
                     )
                     latest_by_member: Dict[Any, Any] = {}
                     for row in cursor.fetchall():
@@ -1507,26 +1507,30 @@ class MySQLStorage(MessageStorage):
                         params.append(end_time_ms)
                     if sender_role == "member":
                         where_clauses.append(
-                            "(m.raw_brief LIKE %s OR m.raw_brief LIKE %s OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s)"
+                            "(m.raw_brief LIKE %s OR m.raw_brief LIKE %s OR m.raw_brief LIKE %s OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s)"
                         )
                         params.extend(
                             [
                                 '%"roleId": 3%',
                                 '%"channelRole": "2"%',
+                                '%"channelRole": 2%',
                                 '%"roleId": 3%',
                                 '%"channelRole": "2"%',
+                                '%"channelRole": 2%',
                             ]
                         )
                     elif sender_role == "fan":
                         where_clauses.append(
-                            "NOT (m.raw_brief LIKE %s OR m.raw_brief LIKE %s OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s)"
+                            "NOT (m.raw_brief LIKE %s OR m.raw_brief LIKE %s OR m.raw_brief LIKE %s OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s)"
                         )
                         params.extend(
                             [
                                 '%"roleId": 3%',
                                 '%"channelRole": "2"%',
+                                '%"channelRole": 2%',
                                 '%"roleId": 3%',
                                 '%"channelRole": "2"%',
+                                '%"channelRole": 2%',
                             ]
                         )
 
@@ -1552,8 +1556,10 @@ class MySQLStorage(MessageStorage):
                             CASE
                                 WHEN m.raw_brief LIKE '%%\"roleId\": 3%%'
                                      OR m.raw_brief LIKE '%%\"channelRole\": \"2\"%%'
+                                     OR m.raw_brief LIKE '%%\"channelRole\": 2%%'
                                      OR mp.ext_json LIKE '%%\"roleId\": 3%%'
                                      OR mp.ext_json LIKE '%%\"channelRole\": \"2\"%%'
+                                     OR mp.ext_json LIKE '%%\"channelRole\": 2%%'
                                 THEN 'member'
                                 ELSE 'fan'
                             END AS sender_role,
@@ -1597,8 +1603,10 @@ class MySQLStorage(MessageStorage):
                             CASE
                                 WHEN m.raw_brief LIKE '%%\"roleId\": 3%%'
                                      OR m.raw_brief LIKE '%%\"channelRole\": \"2\"%%'
+                                     OR m.raw_brief LIKE '%%\"channelRole\": 2%%'
                                      OR mp.ext_json LIKE '%%\"roleId\": 3%%'
                                      OR mp.ext_json LIKE '%%\"channelRole\": \"2\"%%'
+                                     OR mp.ext_json LIKE '%%\"channelRole\": 2%%'
                                 THEN 'member'
                                 ELSE 'fan'
                             END AS sender_role,
@@ -1646,8 +1654,6 @@ def _validate_storage_config(storage_config: Dict[str, Any], storage_type: str) 
             errors.append("database (MySQL database name) is required")
         if not storage_config.get("user"):
             errors.append("user (MySQL user) is required")
-        if not storage_config.get("password"):
-            errors.append("password (MySQL password) is required")
         if not storage_config.get("host"):
             errors.append("host (MySQL host) is required")
     if errors:
