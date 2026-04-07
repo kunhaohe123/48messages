@@ -25,8 +25,11 @@ jobs:
           script: |
             set -e
             cd /opt/48messages
+            OLD_HEAD=$(git rev-parse HEAD)
             git pull --ff-only origin main
-            /opt/48messages-venv/bin/pip install -r requirements.txt
+            if ! git diff --quiet "$OLD_HEAD" HEAD -- requirements.txt; then
+              /opt/48messages-venv/bin/pip install -r requirements.txt
+            fi
             systemctl restart 48messages-scraper
             systemctl restart 48messages-viewer
             systemctl is-active 48messages-scraper

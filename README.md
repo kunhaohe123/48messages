@@ -242,6 +242,14 @@ HTTPS 说明：
 - 直接对公网 IP 配正式 HTTPS 证书通常不可行，最多只能使用自签名证书
 - 域名准备好后，可再接入 Let's Encrypt + Nginx
 
+自动部署说明：
+
+- 仓库已配置 GitHub Actions 工作流 `Deploy`
+- 当 `main` 分支收到新的 push 时，会自动通过 SSH 登录服务器并执行部署
+- 部署脚本会自动拉取最新代码、按需安装依赖、重启抓取和查看服务，并检查本机访问是否正常
+- 如果只是普通代码改动、`requirements.txt` 没变，部署时会跳过 `pip install`
+- 如果需要手动部署，也可以在 GitHub 仓库的 `Actions -> Deploy` 页面点击 `Run workflow`
+
 ## 重要提示
 
 ⚠️ **仅供学习研究使用，请遵守口袋48用户协议**
