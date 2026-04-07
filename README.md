@@ -107,11 +107,24 @@ pip install -r requirements.txt
 python src/pocket48_scraper.py -c config/config.json
 ```
 
+单次抓取并退出：
+
+```bash
+python src/pocket48_scraper.py -c config/config.json --once
+```
+
 查看统计：
 
 ```bash
 python src/pocket48_scraper.py -c config/config.json --stats
 ```
+
+### 抓取策略说明
+
+- 持续监控和 `--once` 都会先请求最新一页消息
+- 如果本地最新消息还没有追上接口返回的数据边界，程序会继续使用返回的 `nextTime` 向历史翻页
+- 分页会持续到命中本地已保存的最新消息，或接口没有更多历史页为止
+- 这比只抓单页更适合持久化增量抓取，但是否绝对不漏仍取决于服务端分页与接口稳定性
 
 ### 6. 导出已抓取消息
 
