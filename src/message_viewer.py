@@ -20,7 +20,14 @@ def load_config(config_path: str) -> Dict[str, Any]:
 def format_timestamp(value: Any) -> str:
     if value in (None, ""):
         return "-"
-    return str(value)
+    try:
+        ts = int(str(value))
+        if ts > 1e12:
+            ts = ts / 1000
+        dt = datetime.fromtimestamp(ts)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, OSError):
+        return str(value)
 
 
 def pretty_json(value: Any) -> str:
@@ -41,6 +48,15 @@ def parse_datetime_local(value: str, is_end: bool = False) -> Optional[int]:
     if len(value) == 10 and is_end:
         dt = dt + timedelta(days=1) - timedelta(milliseconds=1)
     return int(dt.timestamp() * 1000)
+
+
+def build_query_string(params: Dict[str, Any]) -> str:
+    pairs = [
+        f"{key}={html.escape(str(value), quote=True)}"
+        for key, value in params.items()
+        if value not in ("", None)
+    ]
+    return f"&{'&'.join(pairs)}" if pairs else ""
 
 
 def render_layout(title: str, body: str) -> str:
@@ -71,7 +87,8 @@ def render_layout(title: str, body: str) -> str:
     th, td {{ padding: 12px 10px; border-bottom: 1px solid #263041; vertical-align: top; text-align: left; }}
     th {{ color: #94a3b8; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }}
     .mono {{ font-family: Consolas, monospace; word-break: break-all; }}
-    .content {{ max-width: 520px; white-space: pre-wrap; word-break: break-word; }}
+    .content {{ max-width: 520px; white-space: pre-wrap; word-break: break-word; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }}
+    .content-truncated {{ cursor: pointer; color: #94a3b8; font-size: 12px; }}
     .badge {{ display: inline-block; padding: 4px 8px; background: #1e293b; border: 1px solid #334155; border-radius: 999px; font-size: 12px; }}
     .badge-member {{ background: #3b0764; border-color: #7c3aed; color: #f5d0fe; }}
     .badge-fan {{ background: #0f172a; border-color: #334155; }}
@@ -84,7 +101,7 @@ def render_layout(title: str, body: str) -> str:
     .toolbar a {{ padding: 8px 12px; background: #0f172a; border: 1px solid #334155; border-radius: 999px; }}
     .row-member td {{ background: rgba(124, 58, 237, 0.1); }}
     .row-member:hover td {{ background: rgba(124, 58, 237, 0.16); }}
-    @media (max-width: 900px) {{ table, thead, tbody, th, td, tr {{ display: block; }} th {{ display: none; }} td {{ padding: 10px 0; }} tr {{ border-bottom: 1px solid #263041; padding: 12px 0; }} }}
+    @media (max-width: 900px) {{ table, thead, tbody, th, td, tr {{ display: block; }} th {{ display: none; }} td {{ padding: 10px 0; border-bottom: 1px dashed #263041; }} td:first-child {{ padding-top: 16px; }} td:last-child {{ padding-bottom: 16px; }} tr {{ border-bottom: none; padding: 0; margin-bottom: 16px; border-radius: 8px; background: #0f172a; }} tr:hover {{ background: #151b28; }} td:before {{ content: attr(data-label); display: block; color: #64748b; font-size: 11px; text-transform: uppercase; margin-bottom: 4px; }} }}
   </style>
 </head>
 <body>
@@ -118,6 +135,11 @@ def create_app(config_path: str) -> Flask:
         rooms = storage.list_rooms()
         senders = storage.list_senders(room_id)
         stats = storage.get_statistics()
+        msg_types = getattr(
+            storage,
+            "list_msg_types",
+            lambda: ["TEXT", "IMAGE", "VOICE", "VIDEO", "REPLY", "FLIP"],
+        )()
 
         search_kwargs = {
             "room_id": room_id,
@@ -133,20 +155,20 @@ def create_app(config_path: str) -> Flask:
             limit=page_size,
             offset=offset,
         )
-        member_total = storage.search_messages(
-            **search_kwargs,
-            sender_role="member",
-            limit=1,
-            offset=0,
-        )["total"]
-        fan_total = storage.search_messages(
-            **search_kwargs,
-            sender_role="fan",
-            limit=1,
-            offset=0,
-        )["total"]
         total = result["total"]
         items = result["items"]
+        if sender_role:
+            member_total = total if sender_role == "member" else 0
+            fan_total = total if sender_role == "fan" else 0
+        else:
+            member_result = storage.search_messages(
+                **search_kwargs,
+                sender_role="member",
+                limit=0,
+                offset=0,
+            )
+            member_total = member_result["total"]
+            fan_total = total - member_total
         total_pages = max(ceil(total / page_size), 1)
 
         filters = {
@@ -160,15 +182,12 @@ def create_app(config_path: str) -> Flask:
             "page_size": page_size,
         }
 
-        query_without_page = "&".join(
-            f"{key}={html.escape(str(value), quote=True)}"
-            for key, value in filters.items()
-            if value not in ("", None)
-        )
-        if query_without_page:
-            query_without_page = "&" + query_without_page
-        member_only_href = f"/?page=1{query_without_page}&sender_role=member"
-        fan_only_href = f"/?page=1{query_without_page}&sender_role=fan"
+        query_without_page = build_query_string(filters)
+        quick_filter_params = {
+            key: value for key, value in filters.items() if key != "sender_role"
+        }
+        member_only_href = f"/?page=1{build_query_string({**quick_filter_params, 'sender_role': 'member'})}"
+        fan_only_href = f"/?page=1{build_query_string({**quick_filter_params, 'sender_role': 'fan'})}"
 
         options = ['<option value="">全部房间</option>']
         for room in rooms:
@@ -176,6 +195,13 @@ def create_app(config_path: str) -> Flask:
             label = f"{room.get('name') or room['id']} ({room.get('message_count', 0)})"
             options.append(
                 f'<option value="{html.escape(str(room["id"]))}"{selected}>{html.escape(label)}</option>'
+            )
+
+        msg_type_options = ['<option value="">全部类型</option>']
+        for mt in msg_types:
+            selected = " selected" if str(mt) == (msg_type or "") else ""
+            msg_type_options.append(
+                f'<option value="{html.escape(str(mt))}"{selected}>{html.escape(str(mt))}</option>'
             )
 
         message_rows = []
@@ -193,13 +219,13 @@ def create_app(config_path: str) -> Flask:
             row_class = "row-member" if is_member else ""
             message_rows.append(
                 f"""
-                <tr class=\"{row_class}\">
-                  <td><a class=\"mono\" href=\"/messages/{html.escape(str(item["message_id"]))}\">{html.escape(str(item["message_id"]))}</a></td>
-                  <td>{html.escape(str(room_name))}<div class=\"mono\">{html.escape(str(item["room_id"]))}</div></td>
-                  <td>{html.escape(str(item.get("username") or "-"))}<div class=\"mono\">{html.escape(str(item.get("user_id") or "-"))}</div><div><span class=\"badge {role_class}\">{role_label}</span></div></td>
-                  <td><span class=\"badge\">{html.escape(str(item.get("msg_type") or "-"))}</span></td>
-                  <td class=\"content\">{html.escape(str(content))}</td>
-                  <td>{html.escape(format_timestamp(item.get("timestamp")))}</td>
+                <tr class="{row_class}">
+                  <td data-label="消息ID"><a class="mono" href="/messages/{html.escape(str(item["message_id"]))}">{html.escape(str(item["message_id"]))}</a></td>
+                  <td data-label="房间">{html.escape(str(room_name))}<div class="mono">{html.escape(str(item["room_id"]))}</div></td>
+                  <td data-label="发送人">{html.escape(str(item.get("username") or "-"))}<div class="mono">{html.escape(str(item.get("user_id") or "-"))}</div><div><span class="badge {role_class}">{role_label}</span></div></td>
+                  <td data-label="类型"><span class="badge">{html.escape(str(item.get("msg_type") or "-"))}</span></td>
+                  <td data-label="内容" class="content" title="{html.escape(str(content))}">{html.escape(str(content))}</td>
+                  <td data-label="时间">{html.escape(format_timestamp(item.get("timestamp")))}</td>
                 </tr>
                 """
             )
@@ -252,9 +278,9 @@ def create_app(config_path: str) -> Flask:
                 <option value=\"fan\"{" selected" if filters["sender_role"] == "fan" else ""}>粉丝</option>
               </select>
             </div>
-            <div>
-              <label for=\"msg_type\">消息类型</label>
-              <input id=\"msg_type\" name=\"msg_type\" value=\"{html.escape(filters["msg_type"])}\" placeholder=\"如 TEXT、IMAGE\">
+<div>
+              <label for="msg_type">消息类型</label>
+              <select id="msg_type" name="msg_type">{"".join(msg_type_options)}</select>
             </div>
             <div>
               <label for=\"start_time\">开始时间</label>
@@ -296,6 +322,12 @@ def create_app(config_path: str) -> Flask:
           <a href=\"/?page=1{query_without_page}\">首页</a>
           <a href=\"/?page={max(page - 1, 1)}{query_without_page}\">上一页</a>
           <a href=\"/?page={min(page + 1, total_pages)}{query_without_page}\">下一页</a>
+          <form method=\"get\" style=\"display:inline-flex;gap:8px;align-items:center;\">
+            <input type=\"hidden\" name=\"page_size\" value=\"{page_size}\">
+            {"".join(f'<input type="hidden" name="{k}" value="{html.escape(str(v))}">' for k, v in filters.items() if v)}
+            <label style=\"margin:0;font-size:12px;display:flex;align-items:center;gap:4px;\">跳至<input type=\"number\" name=\"page\" min=\"1\" max=\"{total_pages}\" value=\"{page}\" style=\"width:60px;padding:4px 8px;\"></label>
+            <button type=\"submit\" style=\"padding:4px 12px;\">跳转</button>
+          </form>
         </div>
         """
         return render_layout("成员消息查看后台", body)
