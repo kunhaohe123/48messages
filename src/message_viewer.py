@@ -63,6 +63,8 @@ def render_layout(title: str, body: str) -> str:
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{html.escape(title)}</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/themes/dark.css">
   <style>
     :root {{ color-scheme: light dark; }}
     * {{ box-sizing: border-box; }}
@@ -71,27 +73,49 @@ def render_layout(title: str, body: str) -> str:
     a:hover {{ text-decoration: underline; color: #38bdf8; }}
     .wrap {{ max-width: 1320px; margin: 0 auto; padding: 24px; }}
     .header {{ display: flex; justify-content: space-between; gap: 16px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; }}
-    .header h1 {{ margin: 0 0 4px 0; font-size: 24px; font-weight: 700; }}
+    .header h1 {{ margin: 0 0 4px 0; font-size: 24px; font-weight: 800; letter-spacing: -0.02em; }}
     .header div {{ color: #94a3b8; font-size: 14px; }}
-    .panel {{ background: #171b24; border: 1px solid #2a3140; border-radius: 14px; padding: 18px; margin-bottom: 18px; box-shadow: 0 10px 30px rgba(0,0,0,0.2); transition: all 0.3s ease; }}
-    .panel:hover {{ box-shadow: 0 12px 35px rgba(0,0,0,0.25); }}
-    .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }}
-    .stat {{ background: #0f172a; border-radius: 12px; padding: 14px; border: 1px solid #243047; transition: all 0.2s ease; }}
-    .stat:hover {{ transform: translateY(-2px); border-color: #334155; }}
-    .stat .label {{ color: #94a3b8; font-size: 12px; margin-bottom: 6px; }}
-    .stat .value {{ font-size: 24px; font-weight: 700; }}
+    .panel {{ background: #171b24; border: 1px solid #334155; border-radius: 16px; padding: 20px; margin-bottom: 18px; box-shadow: 0 10px 30px rgba(0,0,0,0.2); transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease; }}
+    .panel:hover {{ border-color: #475569; box-shadow: 0 12px 32px rgba(15,23,42,0.32); }}
+    .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }}
+    .stat {{ background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); border-radius: 16px; padding: 20px; border: 1px solid #334155; transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease; display: flex; align-items: center; gap: 16px; position: relative; overflow: hidden; }}
+    .stat::before {{ content: ''; position: absolute; top: 0; right: 0; width: 100px; height: 100px; background: radial-gradient(circle, rgba(59, 130, 246, 0.1) 0%, transparent 70%); }}
+    .stat:hover {{ transform: translateY(-2px); border-color: #475569; box-shadow: 0 12px 32px rgba(15,23,42,0.32); }}
+    .stat-icon {{ font-size: 32px; opacity: 0.9; }}
+    .stat-content {{ flex: 1; }}
+    .stat-value {{ font-size: 28px; font-weight: 800; color: #f1f5f9; margin-bottom: 4px; letter-spacing: -0.02em; }}
+    .stat-value.time {{ font-size: 16px; font-weight: 700; font-family: Consolas, Monaco, 'Courier New', monospace; }}
+    .stat-label {{ color: #94a3b8; font-size: 13px; font-weight: 500; }}
     form {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; align-items: end; }}
-    label {{ display: block; font-size: 12px; color: #94a3b8; margin-bottom: 6px; }}
-    input, select, button {{ width: 100%; box-sizing: border-box; background: #0f172a; color: #edf2f7; border: 1px solid #334155; border-radius: 10px; padding: 10px 12px; font-size: 14px; transition: all 0.2s ease; }}
-    input:focus, select:focus {{ outline: none; border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1); }}
-    button {{ background: #2563eb; border-color: #2563eb; cursor: pointer; font-weight: 600; }}
+    label {{ display: block; font-size: 12px; color: #94a3b8; margin-bottom: 8px; }}
+    input, select, button {{ width: 100%; box-sizing: border-box; background: #0f172a; color: #edf2f7; border: 1px solid #334155; border-radius: 14px; padding: 10px 12px; min-height: 44px; font-size: 14px; line-height: 1.4; transition: all 0.2s ease; }}
+    select {{
+      appearance: none;
+      -webkit-appearance: none;
+      -moz-appearance: none;
+      min-height: 44px;
+      padding-right: 42px;
+      padding-left: 12px;
+      font-size: 13px;
+      line-height: 1.2;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 14 14' fill='none'%3E%3Cpath d='M2.5 5.25L7 9.75L11.5 5.25' stroke='%23e2e8f0' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 14px center;
+      background-size: 14px 14px;
+    }}
+    select::-ms-expand {{ display: none; }}
+    input::placeholder {{ color: #64748b; }}
+    input[type="date"]::-webkit-calendar-picker-indicator {{ display: none; }}
+    input:focus, select:focus {{ outline: none; -webkit-appearance: none; appearance: none; border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.16); }}
+    button {{ min-height: 44px; background: #2563eb; border-color: #2563eb; cursor: pointer; font-weight: 600; }}
     button:hover {{ background: #1d4ed8; transform: translateY(-1px); }}
     button:active {{ transform: translateY(0); }}
-    table {{ width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 14px; }}
+    table {{ width: 100%; border-collapse: separate; border-spacing: 0; table-layout: fixed; font-size: 14px; overflow: hidden; border: 1px solid #334155; border-radius: 14px; background: #0f172a; }}
     th, td {{ padding: 12px 10px; border-bottom: 1px solid #263041; vertical-align: middle; text-align: left; }}
-    th {{ color: #94a3b8; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }}
-    tr {{ transition: all 0.2s ease; }}
-    tr:hover {{ background: rgba(51, 65, 85, 0.1); }}
+    th {{ color: #94a3b8; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; font-weight: 700; background: rgba(15, 23, 42, 0.9); }}
+    tbody tr:last-child td {{ border-bottom: none; }}
+    tr {{ transition: background-color 0.2s ease, box-shadow 0.2s ease; }}
+    tr:hover {{ background: rgba(30, 41, 59, 0.42); box-shadow: inset 0 0 0 1px rgba(71, 85, 105, 0.35); }}
     .mono {{ font-family: Consolas, Monaco, 'Courier New', monospace; word-break: break-all; }}
     .cell-room {{ width: 180px; }}
     .cell-sender {{ width: 180px; }}
@@ -111,20 +135,26 @@ def render_layout(title: str, body: str) -> str:
     .pager a {{ padding: 6px 12px; background: #0f172a; border: 1px solid #334155; border-radius: 8px; font-size: 14px; transition: all 0.2s ease; }}
     .pager a:hover {{ background: #1e293b; border-color: #475569; }}
     .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }}
-    .kv {{ background: #0f172a; border: 1px solid #243047; border-radius: 12px; padding: 14px; transition: all 0.2s ease; }}
-    .kv:hover {{ border-color: #334155; }}
+    .kv {{ background: #0f172a; border: 1px solid #334155; border-radius: 14px; padding: 14px; transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease; }}
+    .kv:hover {{ border-color: #475569; box-shadow: 0 10px 24px rgba(15,23,42,0.24); transform: translateY(-1px); }}
     .kv .key {{ color: #94a3b8; font-size: 12px; margin-bottom: 6px; }}
-    pre {{ background: #0b1120; border: 1px solid #243047; border-radius: 12px; padding: 14px; overflow: auto; white-space: pre-wrap; word-break: break-word; font-family: Consolas, Monaco, 'Courier New', monospace; font-size: 13px; line-height: 1.5; }}
+    pre {{ background: #0b1120; border: 1px solid #334155; border-radius: 14px; padding: 14px; overflow: auto; white-space: pre-wrap; word-break: break-word; font-family: Consolas, Monaco, 'Courier New', monospace; font-size: 13px; line-height: 1.5; }}
+    h2 {{ margin: 0 0 12px 0; font-size: 16px; font-weight: 700; color: #e2e8f0; letter-spacing: -0.01em; }}
     .toolbar {{ display: flex; gap: 12px; flex-wrap: wrap; }}
     .toolbar a {{ padding: 8px 12px; background: #0f172a; border: 1px solid #334155; border-radius: 999px; font-size: 14px; transition: all 0.2s ease; }}
     .toolbar a:hover {{ background: #1e293b; border-color: #475569; transform: translateY(-1px); }}
     .loading {{ display: inline-block; width: 16px; height: 16px; border: 2px solid #334155; border-radius: 50%; border-top-color: #2563eb; animation: spin 1s ease-in-out infinite; }}
     @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-    @media (max-width: 900px) {{ 
+    @media (max-width: 900px) {{
       .wrap {{ padding: 16px; }}
+      .panel {{ padding: 16px; border-radius: 14px; }}
       .header {{ flex-direction: column; align-items: flex-start; gap: 12px; }}
       .stats {{ grid-template-columns: repeat(2, 1fr); }}
       form {{ grid-template-columns: 1fr; }}
+      input, select, button {{ padding-left: 14px; padding-right: 14px; }}
+      select {{ padding-right: 42px; background-position: right 14px center; }}
+      .flatpickr-input, .flatpickr-input:active {{ padding-left: 14px; padding-right: 40px; }}
+      .date-input-wrap .flatpickr-clear {{ right: 14px; }}
       table, thead, tbody, th, td, tr {{ display: block; }}
       th {{ display: none; }}
        td {{ padding: 10px 0; border-bottom: 1px dashed #263041; }}
@@ -137,11 +167,202 @@ def render_layout(title: str, body: str) -> str:
        .pager {{ flex-direction: column; align-items: stretch; gap: 8px; }}
        .pager a {{ text-align: center; }}
     }}
+    .flatpickr-calendar {{
+      background: #1e293b;
+      border: 1px solid #334155;
+      width: 272px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+    }}
+    .flatpickr-months {{
+      padding-top: 2px;
+    }}
+    .flatpickr-prev-month,
+    .flatpickr-next-month {{
+      padding: 8px 10px;
+    }}
+    .flatpickr-prev-month svg,
+    .flatpickr-next-month svg {{
+      width: 12px;
+      height: 12px;
+    }}
+    .flatpickr-day {{
+      color: #edf2f7;
+      height: 34px;
+      line-height: 34px;
+      max-width: 34px;
+      border-radius: 8px;
+    }}
+    .flatpickr-day:hover {{
+      background: #334155;
+      border-color: #334155;
+    }}
+    .flatpickr-day.selected {{
+      background: #2563eb;
+      border-color: #2563eb;
+    }}
+    .flatpickr-months .flatpickr-month,
+    .flatpickr-current-month .flatpickr-monthDropdown-months,
+    .flatpickr-current-month input.cur-year {{
+      color: #edf2f7;
+    }}
+    .flatpickr-current-month {{
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      padding-top: 2px;
+      height: 32px;
+    }}
+    .flatpickr-current-month .flatpickr-monthDropdown-months,
+    .flatpickr-current-month input.cur-year {{
+      min-height: auto;
+      height: auto;
+      padding: 0;
+      border: none;
+      border-radius: 0;
+      background: transparent;
+      box-shadow: none;
+      line-height: 1.2;
+    }}
+    .flatpickr-current-month .flatpickr-monthDropdown-months {{
+      width: auto;
+      padding-right: 18px;
+      font-size: 20px;
+      font-weight: 400;
+      background-position: right 2px center;
+      background-size: 12px 12px;
+    }}
+    .flatpickr-current-month input.cur-year {{
+      width: 4ch;
+      font-size: 20px;
+      font-weight: 300;
+      vertical-align: baseline;
+    }}
+    .flatpickr-current-month .numInputWrapper {{
+      width: auto;
+    }}
+    .flatpickr-weekday {{
+      color: #94a3b8;
+      font-size: 12px;
+      font-weight: 600;
+      line-height: 28px;
+    }}
+    .flatpickr-day.prevMonthDay,
+    .flatpickr-day.nextMonthDay {{
+      color: #64748b;
+    }}
+    .flatpickr-time input {{ color: #edf2f7; }}
+    .flatpickr-input, .flatpickr-input:active {{
+      background: #0f172a;
+      color: #edf2f7;
+      border: 1px solid #334155;
+      border-radius: 14px;
+      padding: 10px 12px;
+      font-size: 14px;
+      min-height: 44px;
+      line-height: 1.2;
+      width: 100%;
+      box-sizing: border-box;
+      appearance: none;
+      -webkit-appearance: none;
+    }}
+    .flatpickr-input:focus {{
+      outline: none;
+      border-color: #2563eb;
+      box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.16);
+    }}
+    .flatpickr-input::placeholder {{ color: #64748b; }}
+    .date-input-wrap {{ position: relative; }}
+    .date-input-wrap input,
+    .date-input-wrap .flatpickr-input {{ padding-right: 40px; }}
+    .date-input-wrap .flatpickr-clear {{
+      position: absolute;
+      right: 12px;
+      top: 50%;
+      transform: translateY(-50%);
+      background: transparent;
+      border: none;
+      color: #64748b;
+      cursor: pointer;
+      font-size: 16px;
+      line-height: 1;
+      padding: 0;
+      width: 20px;
+      height: 20px;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 3;
+    }}
   </style>
 </head>
 <body>
   <div class="wrap">{body}</div>
 </body>
+  <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+  <script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/l10n/zh.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', function() {{
+      const startFp = flatpickr("#start_time", {{
+        locale: "zh",
+        dateFormat: "Y-m-d",
+        allowInput: true,
+        altInput: true,
+        altFormat: "Y-m-d"
+      }});
+
+      const endFp = flatpickr("#end_time", {{
+        locale: "zh",
+        dateFormat: "Y-m-d",
+        allowInput: true,
+        altInput: true,
+        altFormat: "Y-m-d"
+      }});
+
+      const startWrapper = document.querySelector('#start_time').closest('.date-input-wrap');
+      const endWrapper = document.querySelector('#end_time').closest('.date-input-wrap');
+
+      const addClearButton = (wrapper, fp, inputId) => {{
+        // 找到实际的输入框元素（Flatpickr 创建的）
+        const originalInput = document.getElementById(inputId);
+        const flatpickrInput = wrapper.querySelector('input.flatpickr-input:not([type="hidden"])');
+        const targetInput = flatpickrInput || originalInput;
+
+        const clearBtn = document.createElement('button');
+        clearBtn.type = 'button';
+        clearBtn.className = 'flatpickr-clear';
+        clearBtn.innerHTML = '✕';
+        clearBtn.title = '清空';
+
+        wrapper.appendChild(clearBtn);
+
+        fp.config.onChange.push(function(selectedDates) {{
+          clearBtn.style.display = selectedDates.length > 0 ? 'flex' : 'none';
+        }});
+
+        fp.config.onReady.push(function() {{
+          clearBtn.style.display = targetInput.value ? 'flex' : 'none';
+        }});
+
+        clearBtn.addEventListener('click', (e) => {{
+          e.preventDefault();
+          e.stopPropagation();
+          fp.clear();
+          clearBtn.style.display = 'none';
+        }});
+
+        clearBtn.addEventListener('mouseenter', () => {{
+          clearBtn.style.color = '#edf2f7';
+        }});
+        clearBtn.addEventListener('mouseleave', () => {{
+          clearBtn.style.color = '#64748b';
+        }});
+      }};
+
+      addClearButton(startWrapper, startFp, 'start_time');
+      addClearButton(endWrapper, endFp, 'end_time');
+    }});
+  </script>
 </html>"""
 
 
@@ -172,6 +393,23 @@ def create_app(config_path: str) -> Flask:
             limit=0,
             offset=0,
         )
+        today_start = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+        today_stats = storage.search_messages(
+            sender_role="member",
+            msg_type="TEXT",
+            start_time_ms=today_start,
+            limit=0,
+            offset=0,
+        )
+        latest_message = storage.search_messages(
+            sender_role="member",
+            msg_type="TEXT",
+            limit=1,
+            offset=0,
+        )
+        latest_item = latest_message["items"][0] if latest_message["items"] else None
+        latest_time = format_timestamp(latest_item["timestamp"]) if latest_item else "-"
+        latest_sender = latest_item.get("member_name") or latest_item.get("username") or latest_item.get("user_id") if latest_item else "-"
 
         search_kwargs = {
             "room_id": room_id,
@@ -239,8 +477,34 @@ def create_app(config_path: str) -> Flask:
         </div>
 
         <div class="panel stats">
-          <div class="stat"><div class="label">TEXT 消息总数</div><div class="value">{text_stats["total"]}</div></div>
-          <div class="stat"><div class="label">房间数</div><div class="value">{len(rooms)}</div></div>
+          <div class="stat">
+            <div class="stat-icon">💬</div>
+            <div class="stat-content">
+              <div class="stat-value">{text_stats["total"]}</div>
+              <div class="stat-label">总消息数</div>
+            </div>
+          </div>
+          <div class="stat">
+            <div class="stat-icon">🏠</div>
+            <div class="stat-content">
+              <div class="stat-value">{len(rooms)}</div>
+              <div class="stat-label">房间数</div>
+            </div>
+          </div>
+          <div class="stat">
+            <div class="stat-icon">📅</div>
+            <div class="stat-content">
+              <div class="stat-value">{today_stats["total"]}</div>
+              <div class="stat-label">今日消息</div>
+            </div>
+          </div>
+          <div class="stat">
+            <div class="stat-icon">⏰</div>
+            <div class="stat-content">
+              <div class="stat-value time">{latest_time}</div>
+              <div class="stat-label">最新消息 · {html.escape(str(latest_sender))}</div>
+            </div>
+          </div>
         </div>
 
         <div class="panel">
@@ -259,11 +523,15 @@ def create_app(config_path: str) -> Flask:
             </div>
             <div>
               <label for="start_time">开始时间</label>
-              <input id="start_time" name="start_time" type="date" value="{html.escape(filters["start_time"])}">
+              <div class="date-input-wrap">
+                <input id="start_time" name="start_time" type="date" value="{html.escape(start_time)}" placeholder="YYYY-MM-DD">
+              </div>
             </div>
             <div>
               <label for="end_time">结束时间</label>
-              <input id="end_time" name="end_time" type="date" value="{html.escape(filters["end_time"])}">
+              <div class="date-input-wrap">
+                <input id="end_time" name="end_time" type="date" value="{html.escape(end_time)}" placeholder="YYYY-MM-DD">
+              </div>
             </div>
             <div>
               <label for="page_size">每页条数</label>

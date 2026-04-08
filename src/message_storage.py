@@ -1470,7 +1470,7 @@ class MySQLStorage(MessageStorage):
                         params.append(room_id)
                     if sender_keyword:
                         where_clauses.append(
-                            "(m.sender_name LIKE %s OR CAST(m.sender_user_id AS CHAR) LIKE %s)"
+                            "(m.sender_name LIKE %s OR mem.member_name LIKE %s)"
                         )
                         like_value = f"%{sender_keyword}%"
                         params.extend([like_value, like_value])
@@ -1539,7 +1539,8 @@ class MySQLStorage(MessageStorage):
                     )
                     count_query = (
                         "SELECT COUNT(*) AS cnt FROM messages m "
-                        "LEFT JOIN message_payloads mp ON mp.message_id = m.message_id"
+                        "LEFT JOIN message_payloads mp ON mp.message_id = m.message_id "
+                        "LEFT JOIN members mem ON mem.id = m.owner_member_id"
                         f"{where_sql}"
                     )
                     cursor.execute(count_query, params)
@@ -1572,10 +1573,12 @@ class MySQLStorage(MessageStorage):
                             mp.media_cover_url,
                             mp.reply_to_text,
                             mp.flip_question,
-                            mp.flip_answer
+                            mp.flip_answer,
+                            mem.member_name
                         FROM messages m
                         LEFT JOIN rooms r ON r.id = m.room_id
                         LEFT JOIN message_payloads mp ON mp.message_id = m.message_id
+                        LEFT JOIN members mem ON mem.id = m.owner_member_id
                         """
                         f"{where_sql}"
                         " ORDER BY m.message_time DESC, m.message_id DESC LIMIT %s OFFSET %s"
