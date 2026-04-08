@@ -38,6 +38,7 @@
   },
   "monitor": {
     "interval": 60,
+    "max_pages": 5,
     "enabled": true
   }
 }

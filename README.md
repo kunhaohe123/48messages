@@ -109,6 +109,8 @@ pip install -r requirements.txt
 
 `src/pocket48_scraper.py` 现在是统一入口，抓取、导出、统计都从这里执行。
 
+持续抓取模式下，`config/config.json` 里的 `monitor.max_pages` 用来限制每个房间单轮最多翻多少页，默认示例值为 `5`。
+
 ```bash
 python src/pocket48_scraper.py -c config/config.json
 ```
@@ -140,6 +142,7 @@ python src/pocket48_scraper.py -c config/config.json --stats
 - 如果某个房间本地还没有历史数据，且你没有显式传入 `--since-days`，脚本默认只回溯最近 30 天
 - 如果你希望手动限制范围，可以传 `--since-days`，例如 `--since-days 2` 表示只抓最近 2 天
 - 如果你希望限制单次执行的翻页深度，可以传 `--max-pages`，例如 `--max-pages 20` 表示最多翻 20 页
+- 持续抓取模式不会读取命令行里的 `--max-pages`，而是读取配置文件中的 `monitor.max_pages`；这个值越小越省资源，但在高活跃房间里越可能需要多轮才能追平
 - 这比只抓单页更适合持久化增量抓取，但是否绝对不漏仍取决于服务端分页与接口稳定性
 
 ### 6. 导出已抓取消息
