@@ -31,7 +31,10 @@ jobs:
 
             get_viewer_total_messages() {
               for _ in 1 2 3 4 5; do
-                ACTUAL_COUNT=$(curl -fsS http://127.0.0.1:8000/stats-summary | python3 -c "import json,sys; print(json.load(sys.stdin).get('total_messages', ''))") && return 0
+                if ACTUAL_COUNT=$(curl -fsS http://127.0.0.1:8000/stats-summary | python3 -c "import json,sys; print(json.load(sys.stdin).get('total_messages', ''))"); then
+                  return 0
+                fi
+                systemctl --no-pager --full status 48messages-viewer || true
                 sleep 2
               done
               return 1
