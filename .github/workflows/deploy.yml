@@ -29,6 +29,14 @@ jobs:
             set -e
             cd /opt/48messages
 
+            get_viewer_total_messages() {
+              for _ in 1 2 3 4 5; do
+                ACTUAL_COUNT=$(curl -fsS http://127.0.0.1:8000/stats-summary | python3 -c "import json,sys; print(json.load(sys.stdin).get('total_messages', ''))") && return 0
+                sleep 2
+              done
+              return 1
+            }
+
             # 记录部署前版本，后面只在 requirements.txt 变更时安装依赖。
             OLD_HEAD=$(git rev-parse HEAD)
             git pull --ff-only origin main
@@ -48,15 +56,15 @@ jobs:
             # 用服务器本地 Python 直接查数据库，得到“成员 TEXT 消息总数”的真实值。
             EXPECTED_COUNT=$(cd /opt/48messages && PYTHONPATH=src /opt/48messages-venv/bin/python -c "from pocket48_scraper import load_config; from message_storage import create_storage; config = load_config('config/config.json'); storage = create_storage(config); print(storage.search_messages(sender_role='member', msg_type='TEXT', limit=1, offset=0)['total'])")
 
-            # 从稳定的 JSON 统计接口读取“总消息数”，避免校验依赖页面结构。
-            ACTUAL_COUNT=$(curl -fsS http://127.0.0.1:8000/stats-summary | python3 -c "import json,sys; print(json.load(sys.stdin).get('total_messages', ''))")
+            # 从稳定的 JSON 统计接口读取“总消息数”，并等待 viewer 完成重启。
+            get_viewer_total_messages
             if [ "$ACTUAL_COUNT" != "$EXPECTED_COUNT" ]; then
               echo "viewer count mismatch after restart: api=$ACTUAL_COUNT expected=$EXPECTED_COUNT"
 
               # viewer 刚重启时偶发读到旧响应，先重启再重试一次。
               systemctl restart 48messages-viewer
               sleep 2
-              ACTUAL_COUNT=$(curl -fsS http://127.0.0.1:8000/stats-summary | python3 -c "import json,sys; print(json.load(sys.stdin).get('total_messages', ''))")
+              get_viewer_total_messages
             fi
 
             # 二次校验仍不一致时直接让部署失败，避免带着错误页面上线。
