@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import urlencode
 
-from flask import Flask, abort, request
+from flask import Flask, abort, jsonify, request
 
 from message_storage import create_storage
 from pocket48_scraper import DEFAULT_CONFIG_PATH, load_config
@@ -303,30 +303,47 @@ def render_layout(title: str, body: str) -> str:
   <script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/l10n/zh.js"></script>
   <script>
     document.addEventListener('DOMContentLoaded', function() {{
-      const startFp = flatpickr("#start_time", {{
-        locale: "zh",
-        dateFormat: "Y-m-d",
+      // CDN 不可用时退回原生 date input，避免页面脚本直接报错。
+      if (typeof flatpickr !== 'function') {{
+        return;
+      }}
+
+      const startInput = document.querySelector('#start_time');
+      const endInput = document.querySelector('#end_time');
+      if (!startInput || !endInput) {{
+        return;
+      }}
+
+      const startFp = flatpickr(startInput, {{
+        locale: 'zh',
+        dateFormat: 'Y-m-d',
         allowInput: true,
         altInput: true,
-        altFormat: "Y-m-d"
+        altFormat: 'Y-m-d'
       }});
 
-      const endFp = flatpickr("#end_time", {{
-        locale: "zh",
-        dateFormat: "Y-m-d",
+      const endFp = flatpickr(endInput, {{
+        locale: 'zh',
+        dateFormat: 'Y-m-d',
         allowInput: true,
         altInput: true,
-        altFormat: "Y-m-d"
+        altFormat: 'Y-m-d'
       }});
 
-      const startWrapper = document.querySelector('#start_time').closest('.date-input-wrap');
-      const endWrapper = document.querySelector('#end_time').closest('.date-input-wrap');
+      const startWrapper = startInput.closest('.date-input-wrap');
+      const endWrapper = endInput.closest('.date-input-wrap');
+      if (!startWrapper || !endWrapper) {{
+        return;
+      }}
 
       const addClearButton = (wrapper, fp, inputId) => {{
         // 找到实际的输入框元素（Flatpickr 创建的）
         const originalInput = document.getElementById(inputId);
         const flatpickrInput = wrapper.querySelector('input.flatpickr-input:not([type="hidden"])');
         const targetInput = flatpickrInput || originalInput;
+        if (!targetInput) {{
+          return;
+        }}
 
         const clearBtn = document.createElement('button');
         clearBtn.type = 'button';
@@ -371,6 +388,44 @@ def create_app(config_path: str) -> Flask:
     storage = create_storage(config)
     app = Flask(__name__)
 
+    def build_summary_stats() -> Dict[str, Any]:
+        today_start = int(
+            datetime.now()
+            .replace(hour=0, minute=0, second=0, microsecond=0)
+            .timestamp()
+            * 1000
+        )
+        text_stats = storage.search_messages(
+            sender_role="member",
+            msg_type="TEXT",
+            limit=0,
+            offset=0,
+        )
+        rooms = storage.list_rooms()
+        today_stats = storage.search_messages(
+            sender_role="member",
+            msg_type="TEXT",
+            start_time_ms=today_start,
+            limit=0,
+            offset=0,
+        )
+        top_member_today = storage.get_top_member_for_day(today_start)
+        return {
+            "total_messages": text_stats["total"],
+            "total_rooms": len(rooms),
+            "today_messages": today_stats["total"],
+            "top_member_name": top_member_today.get("member_name")
+            if top_member_today
+            else "-",
+            "top_member_count": top_member_today.get("message_count")
+            if top_member_today
+            else 0,
+        }
+
+    @app.route("/stats-summary")
+    def stats_summary() -> Any:
+        return jsonify(build_summary_stats())
+
     @app.route("/")
     def index() -> str:
         page = max(request.args.get("page", default=1, type=int), 1)
@@ -387,23 +442,7 @@ def create_app(config_path: str) -> Flask:
         offset = (page - 1) * page_size
 
         rooms = storage.list_rooms()
-        text_stats = storage.search_messages(
-            sender_role="member",
-            msg_type="TEXT",
-            limit=0,
-            offset=0,
-        )
-        today_start = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
-        today_stats = storage.search_messages(
-            sender_role="member",
-            msg_type="TEXT",
-            start_time_ms=today_start,
-            limit=0,
-            offset=0,
-        )
-        top_member_today = storage.get_top_member_for_day(today_start)
-        top_member_name = top_member_today.get("member_name") if top_member_today else "-"
-        top_member_count = top_member_today.get("message_count") if top_member_today else 0
+        summary_stats = build_summary_stats()
 
         search_kwargs = {
             "room_id": room_id,
@@ -474,7 +513,7 @@ def create_app(config_path: str) -> Flask:
           <div class="stat">
             <div class="stat-icon">💬</div>
             <div class="stat-content">
-              <div class="stat-value">{text_stats["total"]}</div>
+              <div class="stat-value">{summary_stats["total_messages"]}</div>
               <div class="stat-label">总消息数</div>
             </div>
           </div>
@@ -488,15 +527,15 @@ def create_app(config_path: str) -> Flask:
           <div class="stat">
             <div class="stat-icon">📅</div>
             <div class="stat-content">
-              <div class="stat-value">{today_stats["total"]}</div>
+              <div class="stat-value">{summary_stats["today_messages"]}</div>
               <div class="stat-label">今日消息数</div>
             </div>
           </div>
           <div class="stat">
             <div class="stat-icon">⏰</div>
             <div class="stat-content">
-              <div class="stat-value">{html.escape(str(top_member_count))}</div>
-              <div class="stat-label">今日话痨：{html.escape(str(top_member_name))}</div>
+              <div class="stat-value">{html.escape(str(summary_stats["top_member_count"]))}</div>
+              <div class="stat-label">今日话痨：{html.escape(str(summary_stats["top_member_name"]))}</div>
             </div>
           </div>
         </div>

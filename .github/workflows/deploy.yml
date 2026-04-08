@@ -48,19 +48,19 @@ jobs:
             # 用服务器本地 Python 直接查数据库，得到“成员 TEXT 消息总数”的真实值。
             EXPECTED_COUNT=$(cd /opt/48messages && PYTHONPATH=src /opt/48messages-venv/bin/python -c "from pocket48_scraper import load_config; from message_storage import create_storage; config = load_config('config/config.json'); storage = create_storage(config); print(storage.search_messages(sender_role='member', msg_type='TEXT', limit=1, offset=0)['total'])")
 
-            # 从 viewer 本体页面提取“总消息数”，和数据库真实值做对比。
-            ACTUAL_COUNT=$(curl -fsS http://127.0.0.1:8000/ | python3 -c "import re,sys; html=sys.stdin.read(); match=re.search(r'<div class=\"stat-value\">(\\d+)</div>\\s*<div class=\"stat-label\">总消息数</div>', html); print(match.group(1) if match else '')")
+            # 从稳定的 JSON 统计接口读取“总消息数”，避免校验依赖页面结构。
+            ACTUAL_COUNT=$(curl -fsS http://127.0.0.1:8000/stats-summary | python3 -c "import json,sys; print(json.load(sys.stdin).get('total_messages', ''))")
             if [ "$ACTUAL_COUNT" != "$EXPECTED_COUNT" ]; then
-              echo "viewer count mismatch after restart: page=$ACTUAL_COUNT expected=$EXPECTED_COUNT"
+              echo "viewer count mismatch after restart: api=$ACTUAL_COUNT expected=$EXPECTED_COUNT"
 
-              # 页面刚重启时偶发读到旧响应，先重启 viewer 再重试一次。
+              # viewer 刚重启时偶发读到旧响应，先重启再重试一次。
               systemctl restart 48messages-viewer
               sleep 2
-              ACTUAL_COUNT=$(curl -fsS http://127.0.0.1:8000/ | python3 -c "import re,sys; html=sys.stdin.read(); match=re.search(r'<div class=\"stat-value\">(\\d+)</div>\\s*<div class=\"stat-label\">总消息数</div>', html); print(match.group(1) if match else '')")
+              ACTUAL_COUNT=$(curl -fsS http://127.0.0.1:8000/stats-summary | python3 -c "import json,sys; print(json.load(sys.stdin).get('total_messages', ''))")
             fi
 
             # 二次校验仍不一致时直接让部署失败，避免带着错误页面上线。
             if [ "$ACTUAL_COUNT" != "$EXPECTED_COUNT" ]; then
-              echo "viewer count mismatch persists: page=$ACTUAL_COUNT expected=$EXPECTED_COUNT"
+              echo "viewer count mismatch persists: api=$ACTUAL_COUNT expected=$EXPECTED_COUNT"
               exit 1
             fi
