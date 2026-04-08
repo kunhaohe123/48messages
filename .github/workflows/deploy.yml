@@ -1,12 +1,14 @@
 name: Deploy
 
 on:
+  # main 分支有新提交时自动部署，也支持手动触发。
   push:
     branches:
       - main
   workflow_dispatch:
 
 concurrency:
+  # 同一时间只保留一个生产部署，新的部署会取消旧的进行中任务。
   group: production-deploy
   cancel-in-progress: true
 
@@ -21,20 +23,29 @@ jobs:
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           port: ${{ secrets.DEPLOY_PORT || '22' }}
+          # 任一步骤失败时立即终止，避免带故障继续往下执行。
           script_stop: true
           script: |
             set -e
             cd /opt/48messages
+
+            # 记录部署前版本，后面只在 requirements.txt 变更时安装依赖。
             OLD_HEAD=$(git rev-parse HEAD)
             git pull --ff-only origin main
             if ! git diff --quiet "$OLD_HEAD" HEAD -- requirements.txt; then
               /opt/48messages-venv/bin/pip install -r requirements.txt
             fi
+
+            # 重启抓取服务和查看服务，并确认 systemd 状态正常。
             systemctl restart 48messages-scraper
             systemctl restart 48messages-viewer
             systemctl is-active 48messages-scraper
             systemctl is-active 48messages-viewer
+
+            # 先确认本机 Nginx 首页可访问。
             curl -fsS http://127.0.0.1/ > /dev/null
+
+            # 用服务器本地 Python 直接查数据库，得到“成员 TEXT 消息总数”的真实值。
             EXPECTED_COUNT=$(
               cd /opt/48messages && PYTHONPATH=src /opt/48messages-venv/bin/python -c '
 from pocket48_scraper import load_config
@@ -45,13 +56,19 @@ storage = create_storage(config)
 print(storage.search_messages(sender_role="member", msg_type="TEXT", limit=1, offset=0)["total"])
 '
             )
-            ACTUAL_COUNT=$(curl -fsS http://127.0.0.1/ | grep -o 'TEXT 消息总数</div><div class="value">[0-9]\+</div>' | grep -o '[0-9]\+')
+
+            # 从首页统计卡片提取“总消息数”，和数据库真实值做对比。
+            ACTUAL_COUNT=$(curl -fsS http://127.0.0.1/ | python3 -c "import re,sys; html=sys.stdin.read(); match=re.search(r'<div class=\"stat-value\">(\\d+)</div>\\s*<div class=\"stat-label\">总消息数</div>', html); print(match.group(1) if match else '')")
             if [ "$ACTUAL_COUNT" != "$EXPECTED_COUNT" ]; then
               echo "viewer count mismatch after restart: page=$ACTUAL_COUNT expected=$EXPECTED_COUNT"
+
+              # 页面刚重启时偶发读到旧响应，先重启 viewer 再重试一次。
               systemctl restart 48messages-viewer
               sleep 2
-              ACTUAL_COUNT=$(curl -fsS http://127.0.0.1/ | grep -o 'TEXT 消息总数</div><div class="value">[0-9]\+</div>' | grep -o '[0-9]\+')
+              ACTUAL_COUNT=$(curl -fsS http://127.0.0.1/ | python3 -c "import re,sys; html=sys.stdin.read(); match=re.search(r'<div class=\"stat-value\">(\\d+)</div>\\s*<div class=\"stat-label\">总消息数</div>', html); print(match.group(1) if match else '')")
             fi
+
+            # 二次校验仍不一致时直接让部署失败，避免带着错误页面上线。
             if [ "$ACTUAL_COUNT" != "$EXPECTED_COUNT" ]; then
               echo "viewer count mismatch persists: page=$ACTUAL_COUNT expected=$EXPECTED_COUNT"
               exit 1
