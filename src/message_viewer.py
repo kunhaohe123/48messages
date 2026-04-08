@@ -401,15 +401,9 @@ def create_app(config_path: str) -> Flask:
             limit=0,
             offset=0,
         )
-        latest_message = storage.search_messages(
-            sender_role="member",
-            msg_type="TEXT",
-            limit=1,
-            offset=0,
-        )
-        latest_item = latest_message["items"][0] if latest_message["items"] else None
-        latest_time = format_timestamp(latest_item["timestamp"]) if latest_item else "-"
-        latest_sender = latest_item.get("member_name") or latest_item.get("username") or latest_item.get("user_id") if latest_item else "-"
+        top_member_today = storage.get_top_member_for_day(today_start)
+        top_member_name = top_member_today.get("member_name") if top_member_today else "-"
+        top_member_count = top_member_today.get("message_count") if top_member_today else 0
 
         search_kwargs = {
             "room_id": room_id,
@@ -495,14 +489,14 @@ def create_app(config_path: str) -> Flask:
             <div class="stat-icon">📅</div>
             <div class="stat-content">
               <div class="stat-value">{today_stats["total"]}</div>
-              <div class="stat-label">今日消息</div>
+              <div class="stat-label">今日消息数</div>
             </div>
           </div>
           <div class="stat">
             <div class="stat-icon">⏰</div>
             <div class="stat-content">
-              <div class="stat-value time">{latest_time}</div>
-              <div class="stat-label">最新消息 · {html.escape(str(latest_sender))}</div>
+              <div class="stat-value">{html.escape(str(top_member_count))}</div>
+              <div class="stat-label">今日话痨：{html.escape(str(top_member_name))}</div>
             </div>
           </div>
         </div>
@@ -515,7 +509,7 @@ def create_app(config_path: str) -> Flask:
             </div>
             <div>
               <label for="sender">成员</label>
-              <input id="sender" name="sender" value="{html.escape(filters["sender"])}" placeholder="昵称或用户ID">
+              <input id="sender" name="sender" value="{html.escape(filters["sender"])}" placeholder="昵称或姓名">
             </div>
             <div>
               <label for="keyword">关键词</label>

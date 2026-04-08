@@ -241,6 +241,10 @@ class MessageStorage(ABC):
     def get_message_detail(self, message_id: str) -> Optional[Dict[str, Any]]:
         pass
 
+    @abstractmethod
+    def get_top_member_for_day(self, start_time_ms: int) -> Optional[Dict[str, Any]]:
+        pass
+
 
 class SQLiteStorage(MessageStorage):
     def __init__(self, db_path: str = "data/messages.db"):
@@ -652,6 +656,33 @@ class SQLiteStorage(MessageStorage):
             "ext_info": row[6],
             "timestamp": row[7],
             "created_at": row[8],
+        }
+
+    def get_top_member_for_day(self, start_time_ms: int) -> Optional[Dict[str, Any]]:
+        conn = self._connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                COALESCE(NULLIF(username, ''), CAST(user_id AS TEXT), '-') AS member_name,
+                COUNT(*) AS message_count
+            FROM messages
+            WHERE msg_type = ?
+              AND timestamp >= ?
+              AND (ext_info LIKE '%"roleId": 3%' OR ext_info LIKE '%"channelRole": "2"%' OR ext_info LIKE '%"channelRole": 2%')
+            GROUP BY COALESCE(NULLIF(username, ''), CAST(user_id AS TEXT), '-')
+            ORDER BY message_count DESC, MAX(timestamp) DESC
+            LIMIT 1
+            """,
+            ("TEXT", start_time_ms),
+        )
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return None
+        return {
+            "member_name": row[0],
+            "message_count": row[1],
         }
 
 
@@ -1643,6 +1674,50 @@ class MySQLStorage(MessageStorage):
                 logger.error(
                     "获取消息详情失败 message_id=%s: %s", message_id, exc_info=True
                 )
+                raise
+
+    def get_top_member_for_day(self, start_time_ms: int) -> Optional[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT
+                            COALESCE(NULLIF(mem.member_name, ''), NULLIF(m.sender_name, ''), CAST(m.sender_user_id AS CHAR), '-') AS member_name,
+                            COUNT(*) AS message_count
+                        FROM messages m
+                        LEFT JOIN message_payloads mp ON mp.message_id = m.message_id
+                        LEFT JOIN members mem ON mem.id = m.owner_member_id
+                        WHERE m.message_type = %s
+                          AND m.message_time_ms >= %s
+                          AND (
+                            m.raw_brief LIKE %s OR m.raw_brief LIKE %s OR m.raw_brief LIKE %s
+                            OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s
+                          )
+                        GROUP BY COALESCE(NULLIF(mem.member_name, ''), NULLIF(m.sender_name, ''), CAST(m.sender_user_id AS CHAR), '-')
+                        ORDER BY message_count DESC, MAX(m.message_time_ms) DESC
+                        LIMIT 1
+                        """,
+                        (
+                            "TEXT",
+                            start_time_ms,
+                            '%"roleId": 3%',
+                            '%"channelRole": "2"%',
+                            '%"channelRole": 2%',
+                            '%"roleId": 3%',
+                            '%"channelRole": "2"%',
+                            '%"channelRole": 2%',
+                        ),
+                    )
+                    row = cursor.fetchone()
+                    if not row:
+                        return None
+                    return {
+                        "member_name": row["member_name"],
+                        "message_count": row["message_count"],
+                    }
+            except Exception:
+                logger.error("查询当日活跃成员失败: %s", exc_info=True)
                 raise
 
 
