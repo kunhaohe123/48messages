@@ -14,6 +14,8 @@
 │   │   └── token.json       # 本地 token 缓存（忽略提交）
 │   └── messages_export.json # 导出数据（忽略提交）
 ├── docs/
+│   ├── 数据库建表语句.sql
+│   ├── 数据库初始化说明.md
 │   ├── 抓包分析指南.md
 │   ├── 持久化抓取指南.md
 │   └── Charles抓包配置指南.md
@@ -78,17 +80,75 @@ cp config/members.example.json config/members.json
 }
 ```
 
+先按以下顺序初始化数据库：
+
+1. 执行 `docs/数据库建表语句.sql`
+2. 参考 `docs/数据库初始化说明.md` 检查 `config/members.json`
+3. 再运行抓取命令
+
 编辑 `config/members.json`，单独维护成员列表：
 
 ```json
 [
   {
-    "name": "成员名字",
+    "id": 417331,
+    "ownerName": "成员官方名",
+    "pinyin": "ChengYuanMingZi",
+    "nickname": "成员昵称",
+    "birthday": "1996/12/17",
+    "birthplace": "四川 成都",
+    "constellation": "射手座",
+    "height": 170,
+    "bloodType": "-",
+    "hobbies": "可选爱好",
+    "specialty": "可选特长",
+    "groupId": 12,
+    "groupName": "GNZ48",
+    "teamId": 1203,
+    "team": "TEAM Z",
+    "periodId": 1201,
+    "periodName": "GNZ48 一期生",
+    "class": "8",
+    "jtime": "2016/10/23",
+    "ptime": "2016/10/23",
+    "rank": "38",
+    "account": "可选账号标识",
+    "roomId": "67342057",
+    "liveRoomId": 5082313,
     "serverId": 951577,
-    "channelId": 1312655
+    "channelId": 1312655,
+    "wbUid": "可选微博UID",
+    "wbName": "可选微博名",
+    "avatar": "https://example.com/avatar.jpg",
+    "fullPhoto1": "https://example.com/photo1.jpg",
+    "fullPhoto2": "https://example.com/photo2.jpg",
+    "fullPhoto3": "https://example.com/photo3.jpg",
+    "fullPhoto4": "https://example.com/photo4.jpg",
+    "status": 1,
+    "ctime": 1553661473202,
+    "utime": 1757659612547,
+    "isInGroup": true,
+    "note": "可选备注"
   }
 ]
 ```
+
+新结构下，成员资料会先同步到 MySQL 的 `members` 表，再写入 `messages` 表。
+因为 `messages.server_id` 依赖 `members.server_id` 外键，`config/members.json` 至少必须提供：
+
+- `id`
+- `ownerName`
+- `serverId`
+- `channelId`
+
+补充 `roomId` / `liveRoomId` / `team` / `avatar` / `wbUid` / `fullPhoto1` 等扩展字段后，后续更容易做成员资料、房间相册、直播录播、分组筛选等功能。
+
+兼容规则：
+
+ - 成员显示名默认使用 `ownerName`，`name` 不再是必填字段
+- `memberId` 为空时，会自动回退使用 `id`
+- 配置里的 `rank` 会写入数据库字段 `members.election_rank`
+- 其他扩展字段会原样保留，方便后续直接复用
 
 ### 3. 安装依赖
 
@@ -103,13 +163,14 @@ pip install -r requirements.txt
 1. `encryptedPassword` - 登录接口中的 `loginMobile.pwd`
 2. `pa` - 请求头中的 `pa`
 3. `appInfo` - 请求头中的 `appInfo`
-成员的 `channelId` / `serverId` 请填写到 `config/members.json`。
+成员的 `id` / `ownerName` / `channelId` / `serverId` 请填写到 `config/members.json`。
 
 ### 5. 运行程序
 
 `src/pocket48_scraper.py` 现在是统一入口，抓取、导出、统计都从这里执行。
 
 持续抓取模式下，`config/config.json` 里的 `monitor.max_pages` 用来限制每个房间单轮最多翻多少页，默认示例值为 `5`。
+单次抓取模式下，如果你传了 `--since-days` 但没有显式传 `--max-pages`，程序会自动使用 `monitor.since_days_max_pages` 作为保护值；默认示例值为 `20`，避免高活跃房间翻页过深。
 
 ```bash
 python src/pocket48_scraper.py -c config/config.json
@@ -135,6 +196,7 @@ python src/pocket48_scraper.py -c config/config.json --stats
 
 ### 抓取策略说明
 
+- MySQL 模式下，程序启动时会先把 `config/members.json` 同步到 `members` 表
 - 持续监控和 `--once` 都会先请求最新一页消息
 - 抓取时只保留成员本人发送的消息，粉丝消息会在入库前过滤掉
 - 如果本地最新消息还没有追上接口返回的数据边界，程序会继续使用返回的 `nextTime` 向历史翻页
@@ -179,6 +241,8 @@ python src/message_viewer.py -c config/config.json --host 127.0.0.1 --port 8000
 - 按成员昵称 / 成员姓名搜索成员本人消息
 - 按关键词搜索成员本人消息内容和扩展字段
 - 查看单条消息详情
+
+当前数据库结构中已经不再单独维护 `rooms` 表，房间基础信息直接来自 `members` 和 `messages`。
 
 注意：这个页面直接读取当前配置对应的数据库，请自行做好访问控制，不要直接暴露到公网。
 

@@ -51,6 +51,29 @@ _setup_console_encoding()
 DEFAULT_CONFIG_PATH = "config/config.json"
 DEFAULT_TOKEN_PATH = "data/runtime/token.json"
 DEFAULT_MEMBERS_FILENAME = "members.json"
+DEFAULT_SINCE_DAYS_MAX_PAGES = 20
+
+
+def _normalize_member_config(member: Any, index: int) -> Dict[str, Any]:
+    if not isinstance(member, dict):
+        raise ValueError(f"成员配置第 {index} 项必须是对象")
+
+    normalized = dict(member)
+
+    if normalized.get("memberId") is None and normalized.get("id") is not None:
+        normalized["memberId"] = normalized.get("id")
+
+    return normalized
+
+
+def _member_display_name(member: Dict[str, Any]) -> str:
+    return str(
+        member.get("ownerName")
+        or member.get("memberName")
+        or member.get("nickname")
+        or member.get("channelId")
+        or "-"
+    )
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -65,7 +88,15 @@ def load_config(config_path: str) -> Dict[str, Any]:
     if not members_path.exists():
         raise FileNotFoundError(f"成员配置文件不存在: {members_path}")
     with open(members_path, "r", encoding="utf-8") as file:
-        config["members"] = json.load(file)
+        raw_members = json.load(file)
+
+    if not isinstance(raw_members, list):
+        raise ValueError(f"成员配置必须是数组: {members_path}")
+
+    config["members"] = [
+        _normalize_member_config(member, index + 1)
+        for index, member in enumerate(raw_members)
+    ]
 
     return config
 
@@ -121,6 +152,7 @@ class Pocket48Client:
         self.config = load_config(config_path)
         self._thread_local = threading.local()
         self.storage = self._init_storage()
+        self.storage.sync_members(self.config.get("members", []))
         token_file = self.config.get("storage", {}).get(
             "token_file", DEFAULT_TOKEN_PATH
         )
@@ -268,7 +300,9 @@ class Pocket48Client:
         server_id = member.get("serverId")
         channel_id = member.get("channelId")
         if server_id is None or channel_id is None:
-            logger.error("成员配置缺少 serverId 或 channelId: %s", member.get("name"))
+            logger.error(
+                "成员配置缺少 serverId 或 channelId: %s", _member_display_name(member)
+            )
             return {
                 "messages": [],
                 "next_time": next_time,
@@ -285,7 +319,7 @@ class Pocket48Client:
 
         try:
             logger.info(
-                "获取房间消息: %s(%s)", member.get("name", channel_id), channel_id
+                "获取房间消息: %s(%s)", _member_display_name(member), channel_id
             )
             response = self._get_session().post(
                 self._get_url("message_list_path", "/im/api/v1/team/message/list/all"),
@@ -310,10 +344,16 @@ class Pocket48Client:
             normalized_messages = []
             room_id = str(channel_id)
             oldest_raw_timestamp = None
+            newest_raw_timestamp = None
             # 统一整理成存储层可直接消费的结构，避免数据库实现感知接口细节。
             for msg in messages:
                 message_timestamp = msg.get("msgTime")
                 if message_timestamp is not None:
+                    if (
+                        newest_raw_timestamp is None
+                        or message_timestamp > newest_raw_timestamp
+                    ):
+                        newest_raw_timestamp = message_timestamp
                     if (
                         oldest_raw_timestamp is None
                         or message_timestamp < oldest_raw_timestamp
@@ -328,8 +368,10 @@ class Pocket48Client:
                 normalized_messages.append(
                     {
                         "room_id": room_id,
+                        "server_id": server_id,
+                        "channel_id": channel_id,
                         "owner_member_id": server_id,
-                        "member_name": member.get("name", room_id),
+                        "member_name": _member_display_name(member),
                         "message_id": msg.get("msgIdServer") or msg.get("msgIdClient"),
                         "user_id": user_info.get("userId"),
                         "username": user_info.get("nickName"),
@@ -345,6 +387,7 @@ class Pocket48Client:
                 "messages": normalized_messages,
                 "next_time": content.get("nextTime", next_time),
                 "raw_count": len(messages),
+                "newest_raw_timestamp": newest_raw_timestamp,
                 "oldest_raw_timestamp": oldest_raw_timestamp,
             }
 
@@ -414,10 +457,18 @@ class Pocket48Client:
             result = self.get_room_messages(member, limit=limit, next_time=next_time)
             page_messages = result["messages"]
             raw_count = result.get("raw_count", 0)
+            newest_raw_timestamp = result.get("newest_raw_timestamp")
             oldest_raw_timestamp = result.get("oldest_raw_timestamp")
             page_count += 1
 
             if raw_count == 0:
+                break
+
+            if (
+                since_time_ms is not None
+                and newest_raw_timestamp is not None
+                and newest_raw_timestamp < since_time_ms
+            ):
                 break
 
             should_stop = False
@@ -445,7 +496,7 @@ class Pocket48Client:
             if (
                 since_time_ms is not None
                 and oldest_raw_timestamp is not None
-                and oldest_raw_timestamp < since_time_ms
+                and oldest_raw_timestamp <= since_time_ms
             ):
                 break
             if not new_next_time or new_next_time == next_time:
@@ -470,7 +521,8 @@ class Pocket48Client:
         max_retries: int = 5,
     ):
         room_id = str(member.get("channelId"))
-        room_name = member.get("name", room_id)
+        server_id = member.get("serverId")
+        room_name = _member_display_name(member)
         logger.info("开始监控房间 %s(%s)，间隔 %s 秒", room_name, room_id, interval)
 
         consecutive_failures = 0
@@ -491,6 +543,8 @@ class Pocket48Client:
                         status="success",
                         last_message_id=latest_message.get("message_id"),
                         last_message_time_ms=latest_message.get("timestamp"),
+                        server_id=server_id,
+                        channel_id=int(room_id),
                     )
                     logger.info(
                         "房间 %s(%s) 保存了 %s 条新消息", room_name, room_id, saved
@@ -498,7 +552,11 @@ class Pocket48Client:
                     consecutive_failures = 0
                 else:
                     self.storage.record_fetch(
-                        room_id=room_id, messages_count=0, status="success"
+                        room_id=room_id,
+                        messages_count=0,
+                        status="success",
+                        server_id=server_id,
+                        channel_id=int(room_id),
                     )
                     consecutive_failures = 0
 
@@ -522,6 +580,8 @@ class Pocket48Client:
                     messages_count=0,
                     status="failed",
                     error_message=str(exc),
+                    server_id=server_id,
+                    channel_id=int(room_id),
                 )
                 if consecutive_failures >= max_retries:
                     logger.error(
@@ -548,12 +608,14 @@ class MessageScraper:
 
         # CLI 允许重复传入 --member，这里统一按名称过滤并提示缺失项。
         selected = [
-            member for member in members if member.get("name") in set(member_names)
+            member
+            for member in members
+            if _member_display_name(member) in set(member_names)
         ]
         missing_names = [
             name
             for name in member_names
-            if name not in {member.get("name") for member in selected}
+            if name not in {_member_display_name(member) for member in selected}
         ]
         for name in missing_names:
             logger.warning("未找到成员配置: %s", name)
@@ -607,7 +669,7 @@ class MessageScraper:
     ):
         room_id = member.get("channelId")
         server_id = member.get("serverId")
-        room_name = member.get("name", room_id)
+        room_name = _member_display_name(member)
         if room_id is None or server_id is None:
             logger.warning("跳过缺少 serverId/channelId 的成员配置: %s", member)
             return
@@ -634,12 +696,16 @@ class MessageScraper:
                     status="success",
                     last_message_id=latest_message.get("message_id"),
                     last_message_time_ms=latest_message.get("timestamp"),
+                    server_id=server_id,
+                    channel_id=room_id,
                 )
             else:
                 self.client.storage.record_fetch(
                     room_id=str(room_id),
                     messages_count=0,
                     status="success",
+                    server_id=server_id,
+                    channel_id=room_id,
                 )
 
             logger.info(
@@ -655,6 +721,8 @@ class MessageScraper:
                 messages_count=0,
                 status="failed",
                 error_message=str(exc),
+                server_id=server_id,
+                channel_id=room_id,
             )
             logger.error("单次抓取异常 %s(%s): %s", room_name, room_id, exc)
         finally:
@@ -685,6 +753,15 @@ class MessageScraper:
         since_time_ms = None
         if since_days is not None:
             since_time_ms = int((time.time() - since_days * 24 * 60 * 60) * 1000)
+            if max_pages is None:
+                max_pages = monitor_config.get(
+                    "since_days_max_pages", DEFAULT_SINCE_DAYS_MAX_PAGES
+                )
+                logger.info(
+                    "检测到 --since-days=%s 且未指定 --max-pages，自动使用保护值 %s",
+                    since_days,
+                    max_pages,
+                )
         logger.info("开始单次抓取 %s 个成员，并发 %s", len(members), worker_count)
 
         threads: List[threading.Thread] = []

@@ -468,6 +468,8 @@ class SQLiteStorage(MessageStorage):
         error_message: Optional[str] = None,
         last_message_id: Optional[str] = None,
         last_message_time_ms: Optional[int] = None,
+        server_id: Optional[int] = None,
+        channel_id: Optional[int] = None,
     ) -> None:
         conn = self._connect()
         cursor = conn.cursor()
@@ -795,25 +797,53 @@ class MySQLStorage(MessageStorage):
                     """
                     CREATE TABLE IF NOT EXISTS members (
                         id BIGINT PRIMARY KEY,
-                        member_name VARCHAR(255) NOT NULL,
-                        room_id BIGINT NOT NULL,
-                        sender_user_id BIGINT NULL,
+                        owner_name VARCHAR(255) NOT NULL,
+                        pinyin VARCHAR(255) NULL,
+                        nickname VARCHAR(255) NULL,
+                        birthday VARCHAR(32) NULL,
+                        birthplace VARCHAR(255) NULL,
+                        constellation VARCHAR(64) NULL,
+                        height INT NULL,
+                        blood_type VARCHAR(32) NULL,
+                        hobbies TEXT NULL,
+                        specialty TEXT NULL,
+                        group_id BIGINT NULL,
+                        group_name VARCHAR(128) NULL,
+                        team_id BIGINT NULL,
+                        team VARCHAR(128) NULL,
+                        period_id BIGINT NULL,
+                        period_name VARCHAR(128) NULL,
+                        `class` VARCHAR(64) NULL,
+                        jtime VARCHAR(32) NULL,
+                        ptime VARCHAR(32) NULL,
+                        gtime VARCHAR(32) NULL,
+                        qtime VARCHAR(32) NULL,
+                        election_rank VARCHAR(64) NULL,
+                        note TEXT NULL,
+                        account VARCHAR(255) NULL,
+                        room_id BIGINT NULL,
+                        live_room_id BIGINT NULL,
+                        server_id BIGINT NOT NULL,
+                        channel_id BIGINT NOT NULL,
+                        wb_uid VARCHAR(64) NULL,
+                        wb_name VARCHAR(255) NULL,
+                        avatar TEXT NULL,
+                        full_photo1 TEXT NULL,
+                        full_photo2 TEXT NULL,
+                        full_photo3 TEXT NULL,
+                        full_photo4 TEXT NULL,
+                        status INT NULL,
+                        ctime BIGINT NULL,
+                        utime BIGINT NULL,
+                        is_in_group TINYINT(1) NULL,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                        KEY idx_members_room_id (room_id),
-                        KEY idx_members_sender_user_id (sender_user_id)
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-                    """
-                )
-                cursor.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS rooms (
-                        id BIGINT PRIMARY KEY,
-                        owner_member_id BIGINT NOT NULL,
-                        room_name VARCHAR(255) NOT NULL,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                        KEY idx_rooms_owner_member_id (owner_member_id)
+                        UNIQUE KEY uk_members_server_id (server_id),
+                        UNIQUE KEY uk_members_channel_id (channel_id),
+                        KEY idx_members_owner_name (owner_name),
+                        KEY idx_members_group_name (group_name),
+                        KEY idx_members_team (team),
+                        KEY idx_members_room_id (room_id)
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                     """
                 )
@@ -821,23 +851,30 @@ class MySQLStorage(MessageStorage):
                     """
                     CREATE TABLE IF NOT EXISTS messages (
                         message_id VARCHAR(128) PRIMARY KEY,
-                        room_id BIGINT NOT NULL,
+                        room_id BIGINT NULL,
+                        server_id BIGINT NOT NULL,
+                        channel_id BIGINT NOT NULL,
                         sender_user_id BIGINT NULL,
                         sender_name VARCHAR(255) NULL,
-                        owner_member_id BIGINT NOT NULL,
                         message_type VARCHAR(64) NOT NULL,
                         sub_type VARCHAR(64) NULL,
                         text_content LONGTEXT NULL,
+                        ext_info_json LONGTEXT NULL,
+                        raw_message_json LONGTEXT NULL,
                         message_time DATETIME NOT NULL,
                         message_time_ms BIGINT NOT NULL,
                         is_deleted TINYINT(1) NOT NULL DEFAULT 0,
-                        raw_brief LONGTEXT NULL,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                         KEY idx_messages_room_time (room_id, message_time),
-                        KEY idx_messages_owner_time (owner_member_id, message_time),
+                        KEY idx_messages_server_time (server_id, message_time_ms),
+                        KEY idx_messages_channel_time (channel_id, message_time_ms),
                         KEY idx_messages_sender_user_id (sender_user_id),
-                        KEY idx_messages_message_time_ms (message_time_ms)
+                        KEY idx_messages_message_time_ms (message_time_ms),
+                        CONSTRAINT fk_messages_server_id
+                            FOREIGN KEY (server_id) REFERENCES members (server_id)
+                            ON UPDATE CASCADE
+                            ON DELETE RESTRICT
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                     """
                 )
@@ -866,7 +903,8 @@ class MySQLStorage(MessageStorage):
                     """
                     CREATE TABLE IF NOT EXISTS crawl_tasks (
                         id BIGINT PRIMARY KEY AUTO_INCREMENT,
-                        room_id BIGINT NOT NULL,
+                        channel_id BIGINT NOT NULL,
+                        server_id BIGINT NOT NULL,
                         task_type VARCHAR(32) NOT NULL,
                         status VARCHAR(32) NOT NULL,
                         start_time_ms BIGINT NOT NULL,
@@ -875,7 +913,8 @@ class MySQLStorage(MessageStorage):
                         error_message TEXT NULL,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                        KEY idx_crawl_tasks_room_id (room_id),
+                        KEY idx_crawl_tasks_channel_id (channel_id),
+                        KEY idx_crawl_tasks_server_id (server_id),
                         KEY idx_crawl_tasks_status (status),
                         KEY idx_crawl_tasks_last_message_time_ms (last_message_time_ms)
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
@@ -884,12 +923,14 @@ class MySQLStorage(MessageStorage):
                 cursor.execute(
                     """
                     CREATE TABLE IF NOT EXISTS crawl_checkpoints (
-                        room_id BIGINT PRIMARY KEY,
+                        server_id BIGINT NOT NULL,
+                        channel_id BIGINT NOT NULL,
                         last_message_id VARCHAR(128) NULL,
                         last_message_time_ms BIGINT NULL,
                         last_success_at DATETIME NULL,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        PRIMARY KEY (server_id, channel_id),
                         KEY idx_crawl_checkpoints_last_message_time_ms (last_message_time_ms)
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                     """
@@ -901,125 +942,191 @@ class MySQLStorage(MessageStorage):
         finally:
             conn.close()
 
-    def _find_member_sender_user_id(
-        self, messages: List[Dict[str, Any]]
-    ) -> Optional[int]:
-        for message in messages:
-            sender_user_id = _extract_member_sender_user_id(message)
-            if sender_user_id not in (None, ""):
-                return int(sender_user_id) if sender_user_id else None
-        return None
+    def _normalize_member_record(self, member: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": member.get("memberId")
+            if member.get("memberId") is not None
+            else member.get("id"),
+            "owner_name": member.get("ownerName")
+            or member.get("memberName")
+            or member.get("nickname")
+            or member.get("pinyin")
+            or "",
+            "pinyin": member.get("pinyin"),
+            "nickname": member.get("nickname"),
+            "birthday": member.get("birthday"),
+            "birthplace": member.get("birthplace"),
+            "constellation": member.get("constellation"),
+            "height": member.get("height"),
+            "blood_type": member.get("bloodType"),
+            "hobbies": member.get("hobbies"),
+            "specialty": member.get("specialty"),
+            "group_id": member.get("groupId"),
+            "group_name": member.get("groupName"),
+            "team_id": member.get("teamId"),
+            "team": member.get("team"),
+            "period_id": member.get("periodId"),
+            "period_name": member.get("periodName"),
+            "class": member.get("class"),
+            "jtime": member.get("jtime"),
+            "ptime": member.get("ptime"),
+            "gtime": member.get("gtime"),
+            "qtime": member.get("qtime"),
+            "election_rank": member.get("rank"),
+            "note": member.get("note"),
+            "account": member.get("account"),
+            "room_id": member.get("roomId"),
+            "live_room_id": member.get("liveRoomId"),
+            "server_id": member.get("serverId"),
+            "channel_id": member.get("channelId"),
+            "wb_uid": member.get("wbUid"),
+            "wb_name": member.get("wbName"),
+            "avatar": member.get("avatar"),
+            "full_photo1": member.get("fullPhoto1"),
+            "full_photo2": member.get("fullPhoto2"),
+            "full_photo3": member.get("fullPhoto3"),
+            "full_photo4": member.get("fullPhoto4"),
+            "status": member.get("status"),
+            "ctime": member.get("ctime"),
+            "utime": member.get("utime"),
+            "is_in_group": member.get("isInGroup"),
+        }
 
-    def backfill_member_sender_user_ids(self) -> int:
+    def sync_members(self, members: List[Dict[str, Any]]) -> int:
+        rows = []
+        for member in members:
+            row = self._normalize_member_record(member)
+            if (
+                row["id"] is None
+                or row["server_id"] is None
+                or row["channel_id"] is None
+                or not row["owner_name"]
+            ):
+                logger.warning(
+                    "跳过不完整的成员配置: %s",
+                    member.get("ownerName")
+                    or member.get("memberName")
+                    or member.get("nickname")
+                    or member,
+                )
+                continue
+            rows.append(row)
+
+        if not rows:
+            return 0
+
         with self._get_conn() as conn:
             try:
                 with conn.cursor() as cursor:
-                    cursor.execute(
+                    cursor.executemany(
                         """
-                        SELECT owner_member_id, sender_user_id
-                        FROM messages
-                        WHERE raw_brief LIKE %s OR raw_brief LIKE %s OR raw_brief LIKE %s
-                        ORDER BY owner_member_id, message_time_ms DESC
+                        INSERT INTO members (
+                            id, owner_name, pinyin, nickname, birthday, birthplace, constellation,
+                            height, blood_type, hobbies, specialty, group_id, group_name, team_id,
+                            team, period_id, period_name, `class`, jtime, ptime, gtime, qtime, election_rank,
+                            note, account, room_id, live_room_id, server_id, channel_id, wb_uid,
+                            wb_name, avatar, full_photo1, full_photo2, full_photo3, full_photo4,
+                            status, ctime, utime, is_in_group
+                        ) VALUES (
+                            %(id)s, %(owner_name)s, %(pinyin)s, %(nickname)s, %(birthday)s, %(birthplace)s, %(constellation)s,
+                            %(height)s, %(blood_type)s, %(hobbies)s, %(specialty)s, %(group_id)s, %(group_name)s, %(team_id)s,
+                            %(team)s, %(period_id)s, %(period_name)s, %(class)s, %(jtime)s, %(ptime)s, %(gtime)s, %(qtime)s, %(election_rank)s,
+                            %(note)s, %(account)s, %(room_id)s, %(live_room_id)s, %(server_id)s, %(channel_id)s, %(wb_uid)s,
+                            %(wb_name)s, %(avatar)s, %(full_photo1)s, %(full_photo2)s, %(full_photo3)s, %(full_photo4)s,
+                            %(status)s, %(ctime)s, %(utime)s, %(is_in_group)s
+                        ) ON DUPLICATE KEY UPDATE
+                            owner_name = VALUES(owner_name),
+                            pinyin = VALUES(pinyin),
+                            nickname = VALUES(nickname),
+                            birthday = VALUES(birthday),
+                            birthplace = VALUES(birthplace),
+                            constellation = VALUES(constellation),
+                            height = VALUES(height),
+                            blood_type = VALUES(blood_type),
+                            hobbies = VALUES(hobbies),
+                            specialty = VALUES(specialty),
+                            group_id = VALUES(group_id),
+                            group_name = VALUES(group_name),
+                            team_id = VALUES(team_id),
+                            team = VALUES(team),
+                            period_id = VALUES(period_id),
+                            period_name = VALUES(period_name),
+                            `class` = VALUES(`class`),
+                            jtime = VALUES(jtime),
+                            ptime = VALUES(ptime),
+                            gtime = VALUES(gtime),
+                            qtime = VALUES(qtime),
+                            election_rank = VALUES(election_rank),
+                            note = VALUES(note),
+                            account = VALUES(account),
+                            room_id = VALUES(room_id),
+                            live_room_id = VALUES(live_room_id),
+                            wb_uid = VALUES(wb_uid),
+                            wb_name = VALUES(wb_name),
+                            avatar = VALUES(avatar),
+                            full_photo1 = VALUES(full_photo1),
+                            full_photo2 = VALUES(full_photo2),
+                            full_photo3 = VALUES(full_photo3),
+                            full_photo4 = VALUES(full_photo4),
+                            status = VALUES(status),
+                            ctime = VALUES(ctime),
+                            utime = VALUES(utime),
+                            is_in_group = VALUES(is_in_group),
+                            updated_at = CURRENT_TIMESTAMP
                         """,
-                        ('%"roleId": 3%', '%"channelRole": "2"%', '%"channelRole": 2%'),
+                        rows,
                     )
-                    latest_by_member: Dict[Any, Any] = {}
-                    for row in cursor.fetchall():
-                        owner_member_id = row["owner_member_id"]
-                        sender_user_id = row["sender_user_id"]
-                        if (
-                            owner_member_id not in latest_by_member
-                            and sender_user_id not in (None, "")
-                        ):
-                            latest_by_member[owner_member_id] = sender_user_id
-
-                    updated = 0
-                    for owner_member_id, sender_user_id in latest_by_member.items():
-                        updated += cursor.execute(
-                            "UPDATE members SET sender_user_id=%s WHERE id=%s",
-                            (sender_user_id, owner_member_id),
-                        )
                 conn.commit()
-                return updated
+                return len(rows)
             except Exception:
                 conn.rollback()
                 raise
 
+    def _serialize_raw_message(self, message: Dict[str, Any]) -> Optional[str]:
+        return _json_dumps(
+            {
+                "body": _parse_json_like(message.get("content")),
+                "extInfo": _parse_json_like(message.get("ext_info")),
+            }
+        )
+
     def save_message(self, message: Dict[str, Any]) -> bool:
-        owner_member_id = message.get("owner_member_id")
         room_id = message.get("room_id")
-        if owner_member_id is None or room_id is None:
-            raise ValueError(f"消息缺少 owner_member_id 或 room_id，无法写入 MySQL")
+        server_id = message.get("server_id") or message.get("owner_member_id")
+        channel_id = message.get("channel_id")
+        if server_id is None or channel_id is None:
+            raise ValueError("消息缺少 server_id 或 channel_id，无法写入 MySQL")
 
         with self._get_conn() as conn:
             try:
                 with conn.cursor() as cursor:
-                    cursor.execute(
-                        """
-                        INSERT INTO members (id, member_name, room_id, sender_user_id)
-                        VALUES (%s, %s, %s, %s)
-                        ON DUPLICATE KEY UPDATE
-                            member_name = VALUES(member_name),
-                            room_id = VALUES(room_id),
-                            sender_user_id = COALESCE(VALUES(sender_user_id), sender_user_id),
-                            updated_at = CURRENT_TIMESTAMP
-                """,
-                        (
-                            owner_member_id,
-                            message.get("member_name")
-                            or message.get("username")
-                            or str(owner_member_id),
-                            room_id,
-                            _extract_member_sender_user_id(message),
-                        ),
-                    )
-                    cursor.execute(
-                        """
-                        INSERT INTO rooms (id, owner_member_id, room_name)
-                        VALUES (%s, %s, %s)
-                        ON DUPLICATE KEY UPDATE
-                            owner_member_id = VALUES(owner_member_id),
-                            room_name = VALUES(room_name),
-                            updated_at = CURRENT_TIMESTAMP
-                """,
-                        (
-                            room_id,
-                            owner_member_id,
-                            message.get("member_name") or str(room_id),
-                        ),
-                    )
-
                     message_id = str(message.get("message_id") or "")
+                    raw_message_json = self._serialize_raw_message(message)
                     inserted = cursor.execute(
                         """
                         INSERT IGNORE INTO messages (
-                            message_id, room_id, sender_user_id, sender_name, owner_member_id,
-                            message_type, sub_type, text_content, message_time, message_time_ms,
-                            is_deleted, raw_brief
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            message_id, room_id, server_id, channel_id, sender_user_id, sender_name,
+                            message_type, sub_type, text_content, ext_info_json, raw_message_json,
+                            message_time, message_time_ms, is_deleted
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                         (
                             message_id,
                             room_id,
+                            server_id,
+                            channel_id,
                             message.get("user_id"),
                             message.get("username"),
-                            owner_member_id,
                             str(message.get("msg_type") or "UNKNOWN"),
                             message.get("sub_type"),
                             _extract_text_content(
                                 message.get("content"), message.get("ext_info")
                             ),
+                            _json_dumps(_parse_json_like(message.get("ext_info"))),
+                            raw_message_json,
                             _timestamp_ms_to_datetime(message.get("timestamp")),
                             message.get("timestamp"),
                             0,
-                            _json_dumps(
-                                {
-                                    "body": _parse_json_like(message.get("content")),
-                                    "extInfo": _parse_json_like(
-                                        message.get("ext_info")
-                                    ),
-                                }
-                            ),
                         ),
                     )
 
@@ -1074,15 +1181,16 @@ class MySQLStorage(MessageStorage):
             return 0
 
         first_message = messages[0]
-        owner_member_id = first_message.get("owner_member_id")
-        room_id = first_message.get("room_id")
-        if owner_member_id is None or room_id is None:
-            raise ValueError(f"消息缺少 owner_member_id 或 room_id，无法写入 MySQL")
+        server_id = first_message.get("server_id") or first_message.get(
+            "owner_member_id"
+        )
+        channel_id = first_message.get("channel_id")
+        if server_id is None or channel_id is None:
+            raise ValueError("消息缺少 server_id 或 channel_id，无法写入 MySQL")
 
         with self._get_conn() as conn:
             try:
                 with conn.cursor() as cursor:
-                    member_sender_user_id = self._find_member_sender_user_id(messages)
                     message_ids = [
                         str(message.get("message_id") or "") for message in messages
                     ]
@@ -1096,71 +1204,31 @@ class MySQLStorage(MessageStorage):
                         existing_message_ids = {
                             str(row["message_id"] or "") for row in cursor.fetchall()
                         }
-                    cursor.execute(
-                        """
-                        INSERT INTO members (id, member_name, room_id, sender_user_id)
-                        VALUES (%s, %s, %s, %s)
-                        ON DUPLICATE KEY UPDATE
-                            member_name = VALUES(member_name),
-                            room_id = VALUES(room_id),
-                            sender_user_id = COALESCE(VALUES(sender_user_id), sender_user_id),
-                            updated_at = CURRENT_TIMESTAMP
-                """,
-                        (
-                            owner_member_id,
-                            first_message.get("member_name")
-                            or first_message.get("username")
-                            or str(owner_member_id),
-                            room_id,
-                            member_sender_user_id,
-                        ),
-                    )
-                    cursor.execute(
-                        """
-                        INSERT INTO rooms (id, owner_member_id, room_name)
-                        VALUES (%s, %s, %s)
-                        ON DUPLICATE KEY UPDATE
-                            owner_member_id = VALUES(owner_member_id),
-                            room_name = VALUES(room_name),
-                            updated_at = CURRENT_TIMESTAMP
-                """,
-                        (
-                            room_id,
-                            owner_member_id,
-                            first_message.get("member_name") or str(room_id),
-                        ),
-                    )
-
                     message_rows = []
                     payload_rows = []
                     pending_payload_message_ids: set[str] = set()
                     for message in messages:
                         message_id = str(message.get("message_id") or "")
+                        raw_message_json = self._serialize_raw_message(message)
                         message_rows.append(
                             (
                                 message_id,
                                 message.get("room_id"),
+                                message.get("server_id")
+                                or message.get("owner_member_id"),
+                                message.get("channel_id"),
                                 message.get("user_id"),
                                 message.get("username"),
-                                message.get("owner_member_id"),
                                 str(message.get("msg_type") or "UNKNOWN"),
                                 message.get("sub_type"),
                                 _extract_text_content(
                                     message.get("content"), message.get("ext_info")
                                 ),
+                                _json_dumps(_parse_json_like(message.get("ext_info"))),
+                                raw_message_json,
                                 _timestamp_ms_to_datetime(message.get("timestamp")),
                                 message.get("timestamp"),
                                 0,
-                                _json_dumps(
-                                    {
-                                        "body": _parse_json_like(
-                                            message.get("content")
-                                        ),
-                                        "extInfo": _parse_json_like(
-                                            message.get("ext_info")
-                                        ),
-                                    }
-                                ),
                             )
                         )
                         if (
@@ -1192,10 +1260,10 @@ class MySQLStorage(MessageStorage):
                     cursor.executemany(
                         """
                         INSERT IGNORE INTO messages (
-                            message_id, room_id, sender_user_id, sender_name, owner_member_id,
-                            message_type, sub_type, text_content, message_time, message_time_ms,
-                            is_deleted, raw_brief
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            message_id, room_id, server_id, channel_id, sender_user_id, sender_name,
+                            message_type, sub_type, text_content, ext_info_json, raw_message_json,
+                            message_time, message_time_ms, is_deleted
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                         message_rows,
                     )
@@ -1243,7 +1311,7 @@ class MySQLStorage(MessageStorage):
                             m.sender_name AS username,
                             m.text_content AS content,
                             m.message_type AS msg_type,
-                            mp.ext_json AS ext_info,
+                            COALESCE(m.ext_info_json, mp.ext_json) AS ext_info,
                             m.message_time_ms AS timestamp,
                             m.created_at
                         FROM messages m
@@ -1296,7 +1364,7 @@ class MySQLStorage(MessageStorage):
                             m.sender_name AS username,
                             m.text_content AS content,
                             m.message_type AS msg_type,
-                            mp.ext_json AS ext_info,
+                            COALESCE(m.ext_info_json, mp.ext_json) AS ext_info,
                             m.message_time_ms AS timestamp,
                             m.created_at
                         FROM messages m
@@ -1351,19 +1419,24 @@ class MySQLStorage(MessageStorage):
         error_message: Optional[str] = None,
         last_message_id: Optional[str] = None,
         last_message_time_ms: Optional[int] = None,
+        server_id: Optional[int] = None,
+        channel_id: Optional[int] = None,
     ) -> None:
+        if server_id is None or channel_id is None:
+            raise ValueError("记录抓取状态需要 server_id 和 channel_id")
         with self._get_conn() as conn:
             try:
                 with conn.cursor() as cursor:
                     cursor.execute(
                         """
                         INSERT INTO crawl_tasks (
-                            room_id, task_type, status, start_time_ms, end_time_ms,
+                            channel_id, server_id, task_type, status, start_time_ms, end_time_ms,
                             last_message_time_ms, error_message
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                         (
-                            room_id,
+                            channel_id,
+                            server_id,
                             "incremental",
                             status,
                             int(datetime.now().timestamp() * 1000),
@@ -1376,15 +1449,20 @@ class MySQLStorage(MessageStorage):
                         cursor.execute(
                             """
                             INSERT INTO crawl_checkpoints (
-                                room_id, last_message_id, last_message_time_ms, last_success_at
-                            ) VALUES (%s, %s, %s, NOW())
+                                server_id, channel_id, last_message_id, last_message_time_ms, last_success_at
+                            ) VALUES (%s, %s, %s, %s, NOW())
                             ON DUPLICATE KEY UPDATE
                                 last_message_id = COALESCE(VALUES(last_message_id), last_message_id),
                                 last_message_time_ms = COALESCE(VALUES(last_message_time_ms), last_message_time_ms),
                                 last_success_at = VALUES(last_success_at),
                                 updated_at = CURRENT_TIMESTAMP
                         """,
-                            (room_id, last_message_id, last_message_time_ms),
+                            (
+                                server_id,
+                                channel_id,
+                                last_message_id,
+                                last_message_time_ms,
+                            ),
                         )
                 conn.commit()
             except Exception:
@@ -1404,7 +1482,7 @@ class MySQLStorage(MessageStorage):
                     cursor.execute("SELECT COUNT(*) AS cnt FROM messages")
                     total_messages = cursor.fetchone()["cnt"]
                     cursor.execute(
-                        "SELECT COUNT(DISTINCT room_id) AS cnt FROM messages"
+                        "SELECT COUNT(DISTINCT channel_id) AS cnt FROM messages"
                     )
                     total_rooms = cursor.fetchone()["cnt"]
                     cursor.execute(
@@ -1436,14 +1514,14 @@ class MySQLStorage(MessageStorage):
                 with conn.cursor() as cursor:
                     cursor.execute("""
                         SELECT
-                            r.id,
-                            COALESCE(r.room_name, CAST(r.id AS CHAR)) AS name,
+                            m.room_id AS id,
+                            COALESCE(mem.owner_name, CAST(m.room_id AS CHAR), CAST(m.channel_id AS CHAR)) AS name,
                             COUNT(m.message_id) AS message_count,
                             MAX(m.message_time_ms) AS latest_timestamp
-                        FROM rooms r
-                        LEFT JOIN messages m ON m.room_id = r.id
-                        GROUP BY r.id, r.room_name
-                        ORDER BY latest_timestamp DESC, r.id DESC
+                        FROM messages m
+                        LEFT JOIN members mem ON mem.server_id = m.server_id
+                        GROUP BY m.room_id, mem.owner_name, m.channel_id
+                        ORDER BY latest_timestamp DESC, m.room_id DESC
                     """)
                     return list(cursor.fetchall())
             except Exception:
@@ -1501,7 +1579,7 @@ class MySQLStorage(MessageStorage):
                         params.append(room_id)
                     if sender_keyword:
                         where_clauses.append(
-                            "(m.sender_name LIKE %s OR mem.member_name LIKE %s)"
+                            "(m.sender_name LIKE %s OR mem.owner_name LIKE %s)"
                         )
                         like_value = f"%{sender_keyword}%"
                         params.extend([like_value, like_value])
@@ -1509,7 +1587,7 @@ class MySQLStorage(MessageStorage):
                         where_clauses.append(
                             "("
                             "m.text_content LIKE %s OR "
-                            "m.raw_brief LIKE %s OR "
+                            "m.raw_message_json LIKE %s OR "
                             "mp.ext_json LIKE %s OR "
                             "mp.flip_question LIKE %s OR "
                             "mp.flip_answer LIKE %s OR "
@@ -1538,7 +1616,7 @@ class MySQLStorage(MessageStorage):
                         params.append(end_time_ms)
                     if sender_role == "member":
                         where_clauses.append(
-                            "(m.raw_brief LIKE %s OR m.raw_brief LIKE %s OR m.raw_brief LIKE %s OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s)"
+                            "(m.raw_message_json LIKE %s OR m.raw_message_json LIKE %s OR m.raw_message_json LIKE %s OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s)"
                         )
                         params.extend(
                             [
@@ -1552,7 +1630,7 @@ class MySQLStorage(MessageStorage):
                         )
                     elif sender_role == "fan":
                         where_clauses.append(
-                            "NOT (m.raw_brief LIKE %s OR m.raw_brief LIKE %s OR m.raw_brief LIKE %s OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s)"
+                            "NOT (m.raw_message_json LIKE %s OR m.raw_message_json LIKE %s OR m.raw_message_json LIKE %s OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s)"
                         )
                         params.extend(
                             [
@@ -1571,7 +1649,7 @@ class MySQLStorage(MessageStorage):
                     count_query = (
                         "SELECT COUNT(*) AS cnt FROM messages m "
                         "LEFT JOIN message_payloads mp ON mp.message_id = m.message_id "
-                        "LEFT JOIN members mem ON mem.id = m.owner_member_id"
+                        "LEFT JOIN members mem ON mem.server_id = m.server_id"
                         f"{where_sql}"
                     )
                     cursor.execute(count_query, params)
@@ -1581,14 +1659,14 @@ class MySQLStorage(MessageStorage):
                         """
                         SELECT
                             m.room_id,
-                            COALESCE(r.room_name, CAST(m.room_id AS CHAR)) AS room_name,
+                            COALESCE(mem.owner_name, CAST(m.room_id AS CHAR), CAST(m.channel_id AS CHAR)) AS room_name,
                             m.message_id,
                             m.sender_user_id AS user_id,
                             m.sender_name AS username,
                             CASE
-                                WHEN m.raw_brief LIKE '%%\"roleId\": 3%%'
-                                     OR m.raw_brief LIKE '%%\"channelRole\": \"2\"%%'
-                                     OR m.raw_brief LIKE '%%\"channelRole\": 2%%'
+                                WHEN m.raw_message_json LIKE '%%\"roleId\": 3%%'
+                                     OR m.raw_message_json LIKE '%%\"channelRole\": \"2\"%%'
+                                     OR m.raw_message_json LIKE '%%\"channelRole\": 2%%'
                                      OR mp.ext_json LIKE '%%\"roleId\": 3%%'
                                      OR mp.ext_json LIKE '%%\"channelRole\": \"2\"%%'
                                      OR mp.ext_json LIKE '%%\"channelRole\": 2%%'
@@ -1597,7 +1675,7 @@ class MySQLStorage(MessageStorage):
                             END AS sender_role,
                             m.text_content AS content,
                             m.message_type AS msg_type,
-                            mp.ext_json AS ext_info,
+                            COALESCE(m.ext_info_json, mp.ext_json) AS ext_info,
                             m.message_time_ms AS timestamp,
                             m.created_at,
                             mp.media_url,
@@ -1605,11 +1683,10 @@ class MySQLStorage(MessageStorage):
                             mp.reply_to_text,
                             mp.flip_question,
                             mp.flip_answer,
-                            mem.member_name
+                            mem.owner_name AS member_name
                         FROM messages m
-                        LEFT JOIN rooms r ON r.id = m.room_id
                         LEFT JOIN message_payloads mp ON mp.message_id = m.message_id
-                        LEFT JOIN members mem ON mem.id = m.owner_member_id
+                        LEFT JOIN members mem ON mem.server_id = m.server_id
                         """
                         f"{where_sql}"
                         " ORDER BY m.message_time DESC, m.message_id DESC LIMIT %s OFFSET %s"
@@ -1629,15 +1706,15 @@ class MySQLStorage(MessageStorage):
                         """
                         SELECT
                             m.room_id,
-                            COALESCE(r.room_name, CAST(m.room_id AS CHAR)) AS room_name,
+                            COALESCE(mem.owner_name, CAST(m.room_id AS CHAR), CAST(m.channel_id AS CHAR)) AS room_name,
                             m.message_id,
                             m.sender_user_id AS user_id,
                             m.sender_name AS username,
-                            m.owner_member_id,
+                            m.server_id,
                             CASE
-                                WHEN m.raw_brief LIKE '%%\"roleId\": 3%%'
-                                     OR m.raw_brief LIKE '%%\"channelRole\": \"2\"%%'
-                                     OR m.raw_brief LIKE '%%\"channelRole\": 2%%'
+                                WHEN m.raw_message_json LIKE '%%\"roleId\": 3%%'
+                                     OR m.raw_message_json LIKE '%%\"channelRole\": \"2\"%%'
+                                     OR m.raw_message_json LIKE '%%\"channelRole\": 2%%'
                                      OR mp.ext_json LIKE '%%\"roleId\": 3%%'
                                      OR mp.ext_json LIKE '%%\"channelRole\": \"2\"%%'
                                      OR mp.ext_json LIKE '%%\"channelRole\": 2%%'
@@ -1647,7 +1724,7 @@ class MySQLStorage(MessageStorage):
                             m.message_type AS msg_type,
                             m.sub_type,
                             m.text_content AS content,
-                            m.raw_brief,
+                            m.raw_message_json AS raw_brief,
                             m.message_time,
                             m.message_time_ms AS timestamp,
                             m.created_at,
@@ -1660,9 +1737,9 @@ class MySQLStorage(MessageStorage):
                             mp.flip_user_name,
                             mp.flip_question,
                             mp.flip_answer,
-                            mp.ext_json AS ext_info
+                            COALESCE(m.ext_info_json, mp.ext_json) AS ext_info
                         FROM messages m
-                        LEFT JOIN rooms r ON r.id = m.room_id
+                        LEFT JOIN members mem ON mem.server_id = m.server_id
                         LEFT JOIN message_payloads mp ON mp.message_id = m.message_id
                         WHERE m.message_id = %s
                         LIMIT 1
@@ -1683,18 +1760,18 @@ class MySQLStorage(MessageStorage):
                     cursor.execute(
                         """
                         SELECT
-                            COALESCE(NULLIF(mem.member_name, ''), NULLIF(m.sender_name, ''), CAST(m.sender_user_id AS CHAR), '-') AS member_name,
+                            COALESCE(NULLIF(mem.owner_name, ''), NULLIF(m.sender_name, ''), CAST(m.sender_user_id AS CHAR), '-') AS member_name,
                             COUNT(*) AS message_count
                         FROM messages m
                         LEFT JOIN message_payloads mp ON mp.message_id = m.message_id
-                        LEFT JOIN members mem ON mem.id = m.owner_member_id
+                        LEFT JOIN members mem ON mem.server_id = m.server_id
                         WHERE m.message_type = %s
                           AND m.message_time_ms >= %s
                           AND (
-                            m.raw_brief LIKE %s OR m.raw_brief LIKE %s OR m.raw_brief LIKE %s
+                            m.raw_message_json LIKE %s OR m.raw_message_json LIKE %s OR m.raw_message_json LIKE %s
                             OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s
                           )
-                        GROUP BY COALESCE(NULLIF(mem.member_name, ''), NULLIF(m.sender_name, ''), CAST(m.sender_user_id AS CHAR), '-')
+                        GROUP BY COALESCE(NULLIF(mem.owner_name, ''), NULLIF(m.sender_name, ''), CAST(m.sender_user_id AS CHAR), '-')
                         ORDER BY message_count DESC, MAX(m.message_time_ms) DESC
                         LIMIT 1
                         """,
