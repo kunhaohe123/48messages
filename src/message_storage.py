@@ -711,7 +711,7 @@ class MySQLStorage(MessageStorage):
             "password": password,
             "charset": charset,
             "cursorclass": DictCursor,
-            "autocommit": False,
+            "autocommit": True,
         }
         self._server_connection_args = {
             "host": host,
@@ -720,7 +720,7 @@ class MySQLStorage(MessageStorage):
             "password": password,
             "charset": charset,
             "cursorclass": DictCursor,
-            "autocommit": False,
+            "autocommit": True,
         }
         self._pool_size = pool_size
         self._ensure_database()
