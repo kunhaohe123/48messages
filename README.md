@@ -15,7 +15,6 @@
 │   └── messages_export.json # 导出数据（忽略提交）
 ├── docs/
 │   ├── 数据库建表语句.sql
-│   ├── 数据库初始化说明.md
 │   ├── 抓包分析指南.md
 │   ├── 持久化抓取指南.md
 │   └── Charles抓包配置指南.md
@@ -83,7 +82,7 @@ cp config/members.example.json config/members.json
 先按以下顺序初始化数据库：
 
 1. 执行 `docs/数据库建表语句.sql`
-2. 参考 `docs/数据库初始化说明.md` 检查 `config/members.json`
+2. 检查 `config/members.json`
 3. 再运行抓取命令
 
 编辑 `config/members.json`，单独维护成员列表：
