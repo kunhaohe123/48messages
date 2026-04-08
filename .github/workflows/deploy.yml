@@ -35,3 +35,24 @@ jobs:
             systemctl is-active 48messages-scraper
             systemctl is-active 48messages-viewer
             curl -fsS http://127.0.0.1/ > /dev/null
+            EXPECTED_COUNT=$(
+              cd /opt/48messages && PYTHONPATH=src /opt/48messages-venv/bin/python -c '
+from pocket48_scraper import load_config
+from message_storage import create_storage
+
+config = load_config("config/config.json")
+storage = create_storage(config)
+print(storage.search_messages(sender_role="member", msg_type="TEXT", limit=1, offset=0)["total"])
+'
+            )
+            ACTUAL_COUNT=$(curl -fsS http://127.0.0.1/ | grep -o 'TEXT 消息总数</div><div class="value">[0-9]\+</div>' | grep -o '[0-9]\+')
+            if [ "$ACTUAL_COUNT" != "$EXPECTED_COUNT" ]; then
+              echo "viewer count mismatch after restart: page=$ACTUAL_COUNT expected=$EXPECTED_COUNT"
+              systemctl restart 48messages-viewer
+              sleep 2
+              ACTUAL_COUNT=$(curl -fsS http://127.0.0.1/ | grep -o 'TEXT 消息总数</div><div class="value">[0-9]\+</div>' | grep -o '[0-9]\+')
+            fi
+            if [ "$ACTUAL_COUNT" != "$EXPECTED_COUNT" ]; then
+              echo "viewer count mismatch persists: page=$ACTUAL_COUNT expected=$EXPECTED_COUNT"
+              exit 1
+            fi
