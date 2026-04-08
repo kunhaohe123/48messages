@@ -46,16 +46,7 @@ jobs:
             curl -fsS http://127.0.0.1/ > /dev/null
 
             # 用服务器本地 Python 直接查数据库，得到“成员 TEXT 消息总数”的真实值。
-            EXPECTED_COUNT=$(
-              cd /opt/48messages && PYTHONPATH=src /opt/48messages-venv/bin/python -c '
-from pocket48_scraper import load_config
-from message_storage import create_storage
-
-config = load_config("config/config.json")
-storage = create_storage(config)
-print(storage.search_messages(sender_role="member", msg_type="TEXT", limit=1, offset=0)["total"])
-'
-            )
+            EXPECTED_COUNT=$(cd /opt/48messages && PYTHONPATH=src /opt/48messages-venv/bin/python -c "from pocket48_scraper import load_config; from message_storage import create_storage; config = load_config('config/config.json'); storage = create_storage(config); print(storage.search_messages(sender_role='member', msg_type='TEXT', limit=1, offset=0)['total'])")
 
             # 从首页统计卡片提取“总消息数”，和数据库真实值做对比。
             ACTUAL_COUNT=$(curl -fsS http://127.0.0.1/ | python3 -c "import re,sys; html=sys.stdin.read(); match=re.search(r'<div class=\"stat-value\">(\\d+)</div>\\s*<div class=\"stat-label\">总消息数</div>', html); print(match.group(1) if match else '')")
