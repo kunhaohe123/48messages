@@ -435,7 +435,7 @@ class Pocket48Client:
         max_pages: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         room_id = str(member.get("channelId"))
-        room_name = member.get("name", room_id)
+        room_name = _member_display_name(member)
         latest_local = self._get_latest_local_message(room_id)
         if latest_local is None and since_time_ms is None:
             # 首次抓取没有本地边界时，默认只回溯最近 30 天，避免无限追历史。
@@ -480,6 +480,14 @@ class Pocket48Client:
 
                 if since_time_ms is not None and message_timestamp < since_time_ms:
                     should_stop = True
+                    continue
+
+                # 指定时间范围回补历史时，不能再用本地最新消息做停止边界，
+                # 否则会在第一页就因为“消息已存在”而提前停下，无法继续翻到更早日期。
+                if since_time_ms is not None:
+                    collected_messages.append(message)
+                    if message_id:
+                        seen_message_ids.add(message_id)
                     continue
 
                 if self._is_message_newer_than_local(message, latest_local):
