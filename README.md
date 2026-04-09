@@ -20,7 +20,8 @@
 │   └── Charles抓包配置指南.md
 ├── src/
 │   ├── pocket48_scraper.py  # 统一主程序
-│   └── message_storage.py
+│   ├── message_storage.py
+│   └── message_viewer.py
 └── requirements.txt         # Python 依赖
 ```
 
@@ -79,12 +80,6 @@ cp config/members.example.json config/members.json
 }
 ```
 
-先按以下顺序初始化数据库：
-
-1. 执行 `docs/数据库建表语句.sql`
-2. 检查 `config/members.json`
-3. 再运行抓取命令
-
 编辑 `config/members.json`，单独维护成员列表：
 
 ```json
@@ -132,8 +127,8 @@ cp config/members.example.json config/members.json
 ]
 ```
 
-新结构下，成员资料会先同步到 MySQL 的 `members` 表，再写入 `messages` 表。
-因为 `messages.server_id` 依赖 `members.server_id` 外键，`config/members.json` 至少必须提供：
+程序启动后会先同步 `config/members.json` 中的成员资料，再写入消息数据。
+为保证消息能够正常关联成员，`config/members.json` 至少必须提供：
 
 - `id`
 - `ownerName`
@@ -142,10 +137,8 @@ cp config/members.example.json config/members.json
 
 补充 `roomId` / `liveRoomId` / `team` / `avatar` / `wbUid` / `fullPhoto1` 等扩展字段后，后续更容易做成员资料、房间相册、直播录播、分组筛选等功能。
 
-兼容规则：
+补充说明：
 
- - 成员显示名默认使用 `ownerName`，`name` 不再是必填字段
-- `memberId` 为空时，会自动回退使用 `id`
 - 配置里的 `rank` 会写入数据库字段 `members.election_rank`
 - 其他扩展字段会原样保留，方便后续直接复用
 
@@ -155,7 +148,7 @@ cp config/members.example.json config/members.json
 pip install -r requirements.txt
 ```
 
-### 4. 修改代码
+### 4. 填写关键配置
 
 根据抓包结果，填充 `config/config.json` 中的以下关键字段：
 
@@ -203,6 +196,7 @@ python src/pocket48_scraper.py -c config/config.json --stats
 - 如果某个房间本地还没有历史数据，且你没有显式传入 `--since-days`，脚本默认只回溯最近 30 天
 - 如果你希望手动限制范围，可以传 `--since-days`，例如 `--since-days 2` 表示只抓最近 2 天
 - 如果你希望限制单次执行的翻页深度，可以传 `--max-pages`，例如 `--max-pages 20` 表示最多翻 20 页
+- 如果你要补更早历史，可以显式提高 `--max-pages`
 - 持续抓取模式不会读取命令行里的 `--max-pages`，而是读取配置文件中的 `monitor.max_pages`；这个值越小越省资源，但在高活跃房间里越可能需要多轮才能追平
 - 这比只抓单页更适合持久化增量抓取，但是否绝对不漏仍取决于服务端分页与接口稳定性
 
@@ -241,7 +235,7 @@ python src/message_viewer.py -c config/config.json --host 127.0.0.1 --port 8000
 - 按关键词搜索成员本人消息内容和扩展字段
 - 查看单条消息详情
 
-当前数据库结构中已经不再单独维护 `rooms` 表，房间基础信息直接来自 `members` 和 `messages`。
+房间基础信息直接来自 `members` 和 `messages`。
 
 注意：这个页面直接读取当前配置对应的数据库，请自行做好访问控制，不要直接暴露到公网。
 
@@ -330,4 +324,4 @@ HTTPS 说明：
 - [x] 对接房间消息接口
 - [ ] 添加WebSocket实时消息支持
 - [ ] 还原密码加密算法
-- [x] 写入 MySQL（members / rooms / messages / message_payloads / crawl_tasks / crawl_checkpoints）
+- [x] 写入 MySQL（members / messages / message_payloads / crawl_tasks / crawl_checkpoints）
