@@ -8,6 +8,7 @@
 import json
 import time
 import logging
+import logging.handlers
 import threading
 import os
 import sys
@@ -23,8 +24,19 @@ from message_storage import (
     _parse_member_role_from_json,
 )
 
+log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "logs")
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, "scraper.log")
+rotating_handler = logging.handlers.RotatingFileHandler(
+    log_file, encoding="utf-8", mode="w", maxBytes=10 * 1024 * 1024, backupCount=3
+)
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        rotating_handler,
+        logging.StreamHandler(),
+    ],
 )
 logger = logging.getLogger(__name__)
 
@@ -127,13 +139,13 @@ class TokenManager:
             "acquired_at": time.time(),
         }
         self._save_token()
-        logger.info("Token 已保存")
+        logger.info("Token saved")
 
     def get_token(self) -> Optional[str]:
         if not self.token_data:
             return None
         if time.time() >= self.token_data.get("expires_at", 0):
-            logger.warning("Token 已过期")
+            logger.warning("Token expired")
             return None
         return self.token_data.get("access_token")
 
@@ -142,7 +154,7 @@ class TokenManager:
         path = Path(self.token_file)
         if path.exists():
             path.unlink()
-        logger.info("Token 已清除")
+        logger.info("Token cleared")
 
 
 class Pocket48Client:
@@ -232,7 +244,7 @@ class Pocket48Client:
 
     def login(self) -> bool:
         if self.token_manager.get_token():
-            logger.info("使用已保存的 Token")
+            logger.info("Using saved token")
             return True
 
         pocket48_config = self._pocket48_config()
@@ -240,7 +252,7 @@ class Pocket48Client:
         encrypted_password = pocket48_config.get("encryptedPassword")
 
         if not mobile or not encrypted_password:
-            logger.error("缺少 mobile 或 encryptedPassword，无法登录")
+            logger.error("Missing mobile or encryptedPassword, cannot login")
             return False
 
         # 登录接口要求的主体基本固定，真正会变化的是配置里的账号和抓包字段。
@@ -254,7 +266,7 @@ class Pocket48Client:
         }
 
         try:
-            logger.info("开始登录...")
+            logger.info("Starting login...")
             response = self._get_session().post(
                 self._get_url("login_path", "/user/api/v2/login/app/app_login"),
                 json=payload,
@@ -264,13 +276,13 @@ class Pocket48Client:
 
             data = response.json()
             if data.get("status") != 200 or not data.get("success"):
-                logger.error("登录失败: %s", data.get("message"))
+                logger.error("Login failed: %s", data.get("message"))
                 return False
 
             content = data.get("content", {})
             token = content.get("token") or content.get("userInfo", {}).get("token")
             if not token:
-                logger.error("登录成功但未返回 token")
+                logger.error("Login success but no token returned")
                 return False
 
             valid_time_minutes = content.get("userInfo", {}).get("validTime", 40)
@@ -283,7 +295,7 @@ class Pocket48Client:
             return True
 
         except Exception as exc:
-            logger.error("登录异常: %s", exc)
+            logger.error("Login error: %s", exc)
             return False
 
     def get_room_messages(
@@ -319,7 +331,9 @@ class Pocket48Client:
 
         try:
             logger.info(
-                "获取房间消息: %s(%s)", _member_display_name(member), channel_id
+                "Fetching room messages: %s(%s)",
+                _member_display_name(member),
+                channel_id,
             )
             response = self._get_session().post(
                 self._get_url("message_list_path", "/im/api/v1/team/message/list/all"),
@@ -331,7 +345,7 @@ class Pocket48Client:
 
             data = response.json()
             if data.get("status") != 200 or not data.get("success"):
-                logger.error("获取消息失败: %s", data.get("message"))
+                logger.error("Fetch failed: %s", data.get("message"))
                 return {
                     "messages": [],
                     "next_time": next_time,
@@ -382,7 +396,7 @@ class Pocket48Client:
                     }
                 )
 
-            logger.info("获取到 %s 条成员 TEXT 消息", len(normalized_messages))
+            logger.info("Fetched %s member TEXT messages", len(normalized_messages))
             return {
                 "messages": normalized_messages,
                 "next_time": content.get("nextTime", next_time),
@@ -393,9 +407,9 @@ class Pocket48Client:
 
         except requests.HTTPError as exc:
             if exc.response is not None and exc.response.status_code in {401, 403}:
-                logger.warning("Token 失效，清除后等待下次重新登录")
+                logger.warning("Token expired, clearing and waiting for relogin")
                 self.token_manager.clear()
-            logger.error("获取消息异常: %s", exc)
+            logger.error("Fetch message error: %s", exc)
             return {
                 "messages": [],
                 "next_time": next_time,
@@ -403,7 +417,7 @@ class Pocket48Client:
                 "oldest_raw_timestamp": None,
             }
         except Exception as exc:
-            logger.error("获取消息异常: %s", exc)
+            logger.error("Fetch message error: %s", exc)
             return {
                 "messages": [],
                 "next_time": next_time,
@@ -433,6 +447,7 @@ class Pocket48Client:
         limit: int = 100,
         since_time_ms: Optional[int] = None,
         max_pages: Optional[int] = None,
+        page_delay: float = 1.0,
     ) -> List[Dict[str, Any]]:
         room_id = str(member.get("channelId"))
         room_name = _member_display_name(member)
@@ -444,6 +459,8 @@ class Pocket48Client:
         seen_message_ids = set()
         collected_messages: List[Dict[str, Any]] = []
         page_count = 0
+        start_time = time.time()
+        from datetime import datetime
 
         while True:
             if max_pages is not None and page_count >= max_pages:
@@ -499,24 +516,47 @@ class Pocket48Client:
                 should_stop = True
 
             new_next_time = result["next_time"]
+            elapsed = time.time() - start_time
+            oldest_str = (
+                datetime.fromtimestamp(oldest_raw_timestamp / 1000).strftime(
+                    "%m-%d %H:%M"
+                )
+                if oldest_raw_timestamp
+                else "N/A"
+            )
+            logger.info(
+                "[Page %s] [collected %s] [elapsed %.0fs] [oldest %s]",
+                page_count,
+                len(collected_messages),
+                elapsed,
+                oldest_str,
+            )
             if should_stop:
+                logger.info("[%s] Stop: message time before target", room_name)
                 break
             if (
                 since_time_ms is not None
                 and oldest_raw_timestamp is not None
                 and oldest_raw_timestamp <= since_time_ms
             ):
+                logger.info("[%s] Stop: reached target time", room_name)
                 break
-            if not new_next_time or new_next_time == next_time:
+            if not new_next_time:
+                logger.info("[%s] Stop: no more messages", room_name)
+                break
+            if new_next_time == next_time:
+                logger.info("[%s] Stop: pagination ended", room_name)
                 break
             next_time = new_next_time
+            time.sleep(page_delay)
 
+        total_time = time.time() - start_time
         logger.info(
-            "房间 %s(%s) 分页抓取完成: %s 页，新增 %s 条",
+            "[%s] Done: %spages %smessages %.1fs",
             room_name,
-            room_id,
             page_count,
             len(collected_messages),
+            total_time,
         )
         return collected_messages
 
@@ -531,7 +571,12 @@ class Pocket48Client:
         room_id = str(member.get("channelId"))
         server_id = member.get("serverId")
         room_name = _member_display_name(member)
-        logger.info("开始监控房间 %s(%s)，间隔 %s 秒", room_name, room_id, interval)
+        logger.info(
+            "Start monitoring room %s(%s), interval %s seconds",
+            room_name,
+            room_id,
+            interval,
+        )
 
         consecutive_failures = 0
         while True:
@@ -555,7 +600,7 @@ class Pocket48Client:
                         channel_id=int(room_id),
                     )
                     logger.info(
-                        "房间 %s(%s) 保存了 %s 条新消息", room_name, room_id, saved
+                        "Room %s(%s) saved %s new messages", room_name, room_id, saved
                     )
                     consecutive_failures = 0
                 else:
@@ -571,12 +616,12 @@ class Pocket48Client:
                 time.sleep(interval)
 
             except KeyboardInterrupt:
-                logger.info("停止监控房间 %s(%s)", room_name, room_id)
+                logger.info("Stop monitoring room %s(%s)", room_name, room_id)
                 break
             except Exception as exc:
                 consecutive_failures += 1
                 logger.error(
-                    "监控异常 %s(%s) [连续失败 %s/%s]: %s",
+                    "Monitor error %s(%s) [consecutive failures %s/%s]: %s",
                     room_name,
                     room_id,
                     consecutive_failures,
@@ -593,7 +638,9 @@ class Pocket48Client:
                 )
                 if consecutive_failures >= max_retries:
                     logger.error(
-                        "房间 %s(%s) 连续失败达到上限，停止监控", room_name, room_id
+                        "Room %s(%s) consecutive failures reached limit, stopping monitor",
+                        room_name,
+                        room_id,
                     )
                     break
                 time.sleep(interval * min(consecutive_failures, 3))
@@ -626,21 +673,21 @@ class MessageScraper:
             if name not in {_member_display_name(member) for member in selected}
         ]
         for name in missing_names:
-            logger.warning("未找到成员配置: %s", name)
+            logger.warning("Member config not found: %s", name)
         return selected
 
     def run(self, member_names: Optional[List[str]] = None):
         if not self.client.login():
-            logger.error("登录失败，程序退出")
+            logger.error("Login failed, exiting")
             return
 
         members = self._select_members(member_names)
         monitor_config = self.config.get("monitor", {})
         if not members:
-            logger.warning("没有配置监控成员")
+            logger.warning("No members configured for monitoring")
             return
 
-        logger.info("开始监控 %s 个成员", len(members))
+        logger.info("Starting monitoring %s members", len(members))
         interval = monitor_config.get("interval", 60)
         limit = monitor_config.get("limit", 100)
         max_pages = monitor_config.get("max_pages")
@@ -659,13 +706,13 @@ class MessageScraper:
                 thread.start()
                 self.threads.append(thread)
 
-        logger.info("已启动 %s 个房间的监控", len(self.threads))
+        logger.info("Started monitoring %s rooms", len(self.threads))
 
         try:
             while True:
                 time.sleep(1)
         except KeyboardInterrupt:
-            logger.info("停止监控")
+            logger.info("Stop monitoring")
 
     def _run_member_once(
         self,
@@ -673,13 +720,16 @@ class MessageScraper:
         fetch_limit: int,
         since_time_ms: Optional[int] = None,
         max_pages: Optional[int] = None,
+        page_delay: float = 1.0,
         semaphore: Optional[threading.Semaphore] = None,
     ):
         room_id = member.get("channelId")
         server_id = member.get("serverId")
         room_name = _member_display_name(member)
         if room_id is None or server_id is None:
-            logger.warning("跳过缺少 serverId/channelId 的成员配置: %s", member)
+            logger.warning(
+                "Skipping member config missing serverId/channelId: %s", member
+            )
             return
 
         try:
@@ -691,6 +741,7 @@ class MessageScraper:
                 limit=fetch_limit,
                 since_time_ms=since_time_ms,
                 max_pages=max_pages,
+                page_delay=page_delay,
             )
             saved = self.client.save_messages(messages) if messages else 0
 
@@ -717,7 +768,7 @@ class MessageScraper:
                 )
 
             logger.info(
-                "单次抓取 %s(%s): 获取 %s 条，保存 %s 条",
+                "One-time fetch %s(%s): fetched %s, saved %s",
                 room_name,
                 room_id,
                 len(messages),
@@ -732,7 +783,7 @@ class MessageScraper:
                 server_id=server_id,
                 channel_id=room_id,
             )
-            logger.error("单次抓取异常 %s(%s): %s", room_name, room_id, exc)
+            logger.error("One-time fetch error %s(%s): %s", room_name, room_id, exc)
         finally:
             if semaphore is not None:
                 semaphore.release()
@@ -744,40 +795,49 @@ class MessageScraper:
         max_workers: Optional[int] = None,
         since_days: Optional[int] = None,
         max_pages: Optional[int] = None,
+        page_delay: Optional[float] = None,
     ):
         if not self.client.login():
-            logger.error("登录失败，程序退出")
+            logger.error("Login failed, exiting")
             return
 
         members = self._select_members(member_names)
         monitor_config = self.config.get("monitor", {})
         if not members:
-            logger.warning("没有配置监控成员")
+            logger.warning("No members configured")
             return
 
         fetch_limit = limit or monitor_config.get("limit", 100)
         worker_count = max_workers or len(members)
         worker_count = max(1, min(worker_count, len(members)))
         since_time_ms = None
+        effective_page_delay = page_delay
         if since_days is not None:
             since_time_ms = int((time.time() - since_days * 24 * 60 * 60) * 1000)
-            if max_pages is None:
-                max_pages = monitor_config.get(
-                    "since_days_max_pages", DEFAULT_SINCE_DAYS_MAX_PAGES
-                )
-                logger.info(
-                    "检测到 --since-days=%s 且未指定 --max-pages，自动使用保护值 %s",
-                    since_days,
-                    max_pages,
-                )
-        logger.info("开始单次抓取 %s 个成员，并发 %s", len(members), worker_count)
+            if effective_page_delay is None:
+                effective_page_delay = 0.0 if since_days <= 30 else 0.3
+        elif effective_page_delay is None:
+            effective_page_delay = 0.3
+        logger.info(
+            "开始单次抓取 %s 个成员，并发 %s，翻页间隔 %.1f 秒",
+            len(members),
+            worker_count,
+            effective_page_delay,
+        )
 
         threads: List[threading.Thread] = []
         semaphore = threading.Semaphore(worker_count)
         for member in members:
             thread = threading.Thread(
                 target=self._run_member_once,
-                args=(member, fetch_limit, since_time_ms, max_pages, semaphore),
+                args=(
+                    member,
+                    fetch_limit,
+                    since_time_ms,
+                    max_pages,
+                    effective_page_delay,
+                    semaphore,
+                ),
             )
             thread.start()
             threads.append(thread)
@@ -798,42 +858,55 @@ class MessageScraper:
             limit=limit,
             output_format=output_format,
         )
-        logger.info("已导出 %s 条消息到 %s", count, output_path)
+        logger.info("Exported %s messages to %s", count, output_path)
 
     def get_statistics(self) -> Dict[str, Any]:
         return self.client.storage.get_statistics()
 
 
 def print_statistics(stats: Dict[str, Any]):
-    """将存储层返回的统计结果格式化输出到终端。"""
-    print("\n=== 抓取统计 ===")
-    print(f"总消息数: {stats['total_messages']}")
-    print(f"监控房间数: {stats['total_rooms']}")
-    print(f"成功抓取次数: {stats['successful_fetches']}")
-    print("\n消息数前10的房间:")
+    """Print formatted statistics to terminal."""
+    print("\n=== Scrape Statistics ===")
+    print(f"Total messages: {stats['total_messages']}")
+    print(f"Total rooms: {stats['total_rooms']}")
+    print(f"Successful fetches: {stats['successful_fetches']}")
+    print("\nTop 10 rooms by message count:")
     for room, count in stats["top_rooms"]:
-        print(f"  {room}: {count} 条")
+        print(f"  {room}: {count}")
 
 
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="口袋48成员本人消息抓取工具")
+    parser = argparse.ArgumentParser(description="Pocket48 member message scraper")
     parser.add_argument(
-        "-c", "--config", default=DEFAULT_CONFIG_PATH, help="配置文件路径"
+        "-c", "--config", default=DEFAULT_CONFIG_PATH, help="Config file path"
     )
     parser.add_argument(
-        "--export-format", choices=["json", "csv"], help="导出数据库中的消息"
+        "--export-format", choices=["json", "csv"], help="Export messages from database"
     )
-    parser.add_argument("--output", help="导出文件路径")
-    parser.add_argument("--room-id", help="仅导出指定房间的消息")
-    parser.add_argument("--limit", type=int, help="导出消息数量上限")
-    parser.add_argument("--once", action="store_true", help="每个成员只抓取一次后退出")
-    parser.add_argument("--member", action="append", help="仅抓取指定成员，可重复传入")
-    parser.add_argument("--workers", type=int, help="单次抓取时的最大并发成员数")
-    parser.add_argument("--since-days", type=int, help="仅抓取最近 N 天的消息")
-    parser.add_argument("--max-pages", type=int, help="单次抓取最多翻页数")
-    parser.add_argument("--stats", action="store_true", help="显示抓取统计信息")
+    parser.add_argument("--output", help="Export file path")
+    parser.add_argument("--room-id", help="Export messages for specific room only")
+    parser.add_argument("--limit", type=int, help="Export message limit")
+    parser.add_argument(
+        "--once", action="store_true", help="Fetch once for each member then exit"
+    )
+    parser.add_argument(
+        "--member", action="append", help="Fetch specific member only, can repeat"
+    )
+    parser.add_argument(
+        "--workers", type=int, help="Max concurrent members for one-time fetch"
+    )
+    parser.add_argument(
+        "--since-days", type=int, help="Fetch messages from last N days"
+    )
+    parser.add_argument("--max-pages", type=int, help="Max pages for one-time fetch")
+    parser.add_argument(
+        "--page-delay",
+        type=float,
+        help="Delay between pages in seconds (default: 0 for <=30 days, otherwise 0.3)",
+    )
+    parser.add_argument("--stats", action="store_true", help="Show scrape statistics")
     args = parser.parse_args()
 
     try:
@@ -843,7 +916,7 @@ def main():
             return
         if args.export_format:
             if not args.output:
-                raise ValueError("使用导出功能时必须提供 --output")
+                raise ValueError("Must provide --output when using export")
             scraper.export(
                 output_path=args.output,
                 output_format=args.export_format,
@@ -858,11 +931,12 @@ def main():
                 max_workers=args.workers,
                 since_days=args.since_days,
                 max_pages=args.max_pages,
+                page_delay=args.page_delay,
             )
             return
         scraper.run(member_names=args.member)
     except Exception as exc:
-        logger.error("程序异常: %s", exc)
+        logger.error("Program error: %s", exc)
         raise
 
 
