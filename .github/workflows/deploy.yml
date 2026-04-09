@@ -47,10 +47,9 @@ jobs:
               /opt/48messages-venv/bin/pip install -r requirements.txt
             fi
 
-            # 重启抓取服务和查看服务，并确认 systemd 状态正常。
-            systemctl restart 48messages-scraper
+            # 先停掉抓取服务，避免校验 viewer 时数据库仍在继续写入。
+            systemctl stop 48messages-scraper
             systemctl restart 48messages-viewer
-            systemctl is-active 48messages-scraper
             systemctl is-active 48messages-viewer
 
             # 先确认本机 Nginx 首页可访问。
@@ -75,3 +74,7 @@ jobs:
               echo "viewer count mismatch persists: api=$ACTUAL_COUNT expected=$EXPECTED_COUNT"
               exit 1
             fi
+
+            # viewer 校验通过后再启动抓取服务，避免部署期间漏抓太久。
+            systemctl start 48messages-scraper
+            systemctl is-active 48messages-scraper
