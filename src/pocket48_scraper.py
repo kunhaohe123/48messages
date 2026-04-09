@@ -64,6 +64,14 @@ DEFAULT_CONFIG_PATH = "config/config.json"
 DEFAULT_TOKEN_PATH = "data/runtime/token.json"
 DEFAULT_MEMBERS_FILENAME = "members.json"
 DEFAULT_SINCE_DAYS_MAX_PAGES = 20
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def resolve_project_path(path_str: str) -> Path:
+    path = Path(path_str)
+    if path.is_absolute():
+        return path
+    return PROJECT_ROOT / path
 
 
 def _normalize_member_config(member: Any, index: int) -> Dict[str, Any]:
@@ -117,18 +125,18 @@ class TokenManager:
     """负责本地缓存 token，并在过期后让上层重新登录。"""
 
     def __init__(self, token_file: str = DEFAULT_TOKEN_PATH):
-        self.token_file = token_file
+        self.token_file = resolve_project_path(token_file)
         self.token_data = self._load_token()
 
     def _load_token(self) -> Dict[str, Any]:
-        path = Path(self.token_file)
+        path = self.token_file
         if not path.exists():
             return {}
         with open(path, "r", encoding="utf-8") as file:
             return json.load(file)
 
     def _save_token(self):
-        Path(self.token_file).parent.mkdir(parents=True, exist_ok=True)
+        self.token_file.parent.mkdir(parents=True, exist_ok=True)
         with open(self.token_file, "w", encoding="utf-8") as file:
             json.dump(self.token_data, file, ensure_ascii=False, indent=2)
 
@@ -151,7 +159,7 @@ class TokenManager:
 
     def clear(self):
         self.token_data = {}
-        path = Path(self.token_file)
+        path = self.token_file
         if path.exists():
             path.unlink()
         logger.info("Token cleared")

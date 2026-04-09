@@ -1,7 +1,6 @@
 config/config.json
 data/runtime/token.json
 data/logs/
-src/data/
 __pycache__/
 *.pyc
 .venv/
