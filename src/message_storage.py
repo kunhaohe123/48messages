@@ -238,6 +238,57 @@ class MessageStorage(ABC):
         pass
 
     @abstractmethod
+    def get_history_checkpoint(
+        self, server_id: int, channel_id: int
+    ) -> Optional[Dict[str, Any]]:
+        pass
+
+    @abstractmethod
+    def start_history_fetch(
+        self, server_id: int, channel_id: int, target_time_ms: int
+    ) -> None:
+        pass
+
+    @abstractmethod
+    def update_history_checkpoint_progress(
+        self,
+        server_id: int,
+        channel_id: int,
+        oldest_covered_message_id: Optional[str],
+        oldest_covered_time_ms: Optional[int],
+        resume_next_time: Optional[int],
+        last_page_count: int,
+        cursor_verified: Optional[bool] = None,
+    ) -> None:
+        pass
+
+    @abstractmethod
+    def finish_history_fetch_success(
+        self,
+        server_id: int,
+        channel_id: int,
+        target_time_ms: int,
+        oldest_covered_message_id: Optional[str],
+        oldest_covered_time_ms: Optional[int],
+        resume_next_time: Optional[int],
+        last_page_count: int,
+        cursor_verified: Optional[bool] = None,
+    ) -> None:
+        pass
+
+    @abstractmethod
+    def finish_history_fetch_failed(
+        self,
+        server_id: int,
+        channel_id: int,
+        status: str,
+        error_message: Optional[str],
+        resume_next_time: Optional[int],
+        last_page_count: int,
+    ) -> None:
+        pass
+
+    @abstractmethod
     def export_messages(
         self,
         output_path: str,
@@ -338,6 +389,27 @@ class SQLiteStorage(MessageStorage):
                 error_message TEXT
             )
         """)
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS crawl_history_checkpoints (
+                server_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                oldest_covered_message_id TEXT,
+                oldest_covered_time_ms INTEGER,
+                resume_next_time INTEGER,
+                target_time_ms INTEGER,
+                status TEXT NOT NULL DEFAULT 'idle',
+                cursor_verified INTEGER NOT NULL DEFAULT 0,
+                last_page_count INTEGER NOT NULL DEFAULT 0,
+                last_run_started_at TIMESTAMP,
+                last_run_finished_at TIMESTAMP,
+                last_error_message TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (server_id, channel_id)
+            )
+        """
+        )
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_room_id
             ON messages(room_id, timestamp DESC)
@@ -490,6 +562,183 @@ class SQLiteStorage(MessageStorage):
     def get_latest_message(self, room_id: str) -> Optional[Dict[str, Any]]:
         messages = self.get_messages(room_id, 1)
         return messages[0] if messages else None
+
+    def get_history_checkpoint(
+        self, server_id: int, channel_id: int
+    ) -> Optional[Dict[str, Any]]:
+        conn = self._connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT server_id, channel_id, oldest_covered_message_id, oldest_covered_time_ms,
+                   resume_next_time, target_time_ms, status, cursor_verified,
+                   last_page_count, last_run_started_at, last_run_finished_at,
+                   last_error_message, created_at, updated_at
+            FROM crawl_history_checkpoints
+            WHERE server_id = ? AND channel_id = ?
+            LIMIT 1
+        """,
+            (server_id, channel_id),
+        )
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return None
+        return {
+            "server_id": row[0],
+            "channel_id": row[1],
+            "oldest_covered_message_id": row[2],
+            "oldest_covered_time_ms": row[3],
+            "resume_next_time": row[4],
+            "target_time_ms": row[5],
+            "status": row[6],
+            "cursor_verified": bool(row[7]),
+            "last_page_count": row[8],
+            "last_run_started_at": row[9],
+            "last_run_finished_at": row[10],
+            "last_error_message": row[11],
+            "created_at": row[12],
+            "updated_at": row[13],
+        }
+
+    def start_history_fetch(
+        self, server_id: int, channel_id: int, target_time_ms: int
+    ) -> None:
+        conn = self._connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO crawl_history_checkpoints (
+                server_id, channel_id, target_time_ms, status,
+                last_page_count, last_run_started_at, last_run_finished_at,
+                last_error_message, updated_at
+            ) VALUES (?, ?, ?, 'running', 0, CURRENT_TIMESTAMP, NULL, NULL, CURRENT_TIMESTAMP)
+            ON CONFLICT(server_id, channel_id) DO UPDATE SET
+                target_time_ms = excluded.target_time_ms,
+                status = 'running',
+                last_page_count = 0,
+                last_run_started_at = CURRENT_TIMESTAMP,
+                last_run_finished_at = NULL,
+                last_error_message = NULL,
+                updated_at = CURRENT_TIMESTAMP
+        """,
+            (server_id, channel_id, target_time_ms),
+        )
+        conn.commit()
+        conn.close()
+
+    def update_history_checkpoint_progress(
+        self,
+        server_id: int,
+        channel_id: int,
+        oldest_covered_message_id: Optional[str],
+        oldest_covered_time_ms: Optional[int],
+        resume_next_time: Optional[int],
+        last_page_count: int,
+        cursor_verified: Optional[bool] = None,
+    ) -> None:
+        conn = self._connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE crawl_history_checkpoints
+            SET oldest_covered_message_id = COALESCE(?, oldest_covered_message_id),
+                oldest_covered_time_ms = COALESCE(?, oldest_covered_time_ms),
+                resume_next_time = ?,
+                status = 'running',
+                cursor_verified = COALESCE(?, cursor_verified),
+                last_page_count = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE server_id = ? AND channel_id = ?
+        """,
+            (
+                oldest_covered_message_id,
+                oldest_covered_time_ms,
+                resume_next_time,
+                None if cursor_verified is None else int(cursor_verified),
+                last_page_count,
+                server_id,
+                channel_id,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+    def finish_history_fetch_success(
+        self,
+        server_id: int,
+        channel_id: int,
+        target_time_ms: int,
+        oldest_covered_message_id: Optional[str],
+        oldest_covered_time_ms: Optional[int],
+        resume_next_time: Optional[int],
+        last_page_count: int,
+        cursor_verified: Optional[bool] = None,
+    ) -> None:
+        conn = self._connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE crawl_history_checkpoints
+            SET target_time_ms = ?,
+                oldest_covered_message_id = COALESCE(?, oldest_covered_message_id),
+                oldest_covered_time_ms = COALESCE(?, oldest_covered_time_ms),
+                resume_next_time = ?,
+                status = 'success',
+                cursor_verified = COALESCE(?, cursor_verified),
+                last_page_count = ?,
+                last_run_finished_at = CURRENT_TIMESTAMP,
+                last_error_message = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE server_id = ? AND channel_id = ?
+        """,
+            (
+                target_time_ms,
+                oldest_covered_message_id,
+                oldest_covered_time_ms,
+                resume_next_time,
+                None if cursor_verified is None else int(cursor_verified),
+                last_page_count,
+                server_id,
+                channel_id,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+    def finish_history_fetch_failed(
+        self,
+        server_id: int,
+        channel_id: int,
+        status: str,
+        error_message: Optional[str],
+        resume_next_time: Optional[int],
+        last_page_count: int,
+    ) -> None:
+        conn = self._connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE crawl_history_checkpoints
+            SET status = ?,
+                resume_next_time = ?,
+                last_page_count = ?,
+                last_run_finished_at = CURRENT_TIMESTAMP,
+                last_error_message = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE server_id = ? AND channel_id = ?
+        """,
+            (
+                status,
+                resume_next_time,
+                last_page_count,
+                error_message,
+                server_id,
+                channel_id,
+            ),
+        )
+        conn.commit()
+        conn.close()
 
     def export_messages(
         self,
@@ -868,12 +1117,21 @@ class MySQLStorage(MessageStorage):
         lock = self._get_pool_lock()
         with lock:
             if MySQLStorage._pool:
-                return MySQLStorage._pool.pop()
+                conn = MySQLStorage._pool.pop()
+                try:
+                    conn.ping(reconnect=True)
+                    return conn
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
         conn = pymysql.connect(**self.connection_args)
         return conn
 
     def _return_connection(self, conn: pymysql.connections.Connection):
         try:
+            conn.ping(reconnect=False)
             lock = self._get_pool_lock()
             with lock:
                 if len(MySQLStorage._pool) < self._pool_size:
@@ -1061,6 +1319,29 @@ class MySQLStorage(MessageStorage):
                         PRIMARY KEY (server_id, channel_id),
                         KEY idx_crawl_checkpoints_last_message_time_ms (last_message_time_ms)
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='抓取断点表'
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS crawl_history_checkpoints (
+                        server_id BIGINT NOT NULL COMMENT '房间 server_id',
+                        channel_id BIGINT NOT NULL COMMENT '房间 channel_id',
+                        oldest_covered_message_id VARCHAR(128) NULL COMMENT '已连续覆盖的最老成员消息ID',
+                        oldest_covered_time_ms BIGINT NULL COMMENT '已连续覆盖的最老时间戳',
+                        resume_next_time BIGINT NULL COMMENT '下次历史续翻优先尝试的 nextTime',
+                        target_time_ms BIGINT NULL COMMENT '本次历史补抓目标时间',
+                        status VARCHAR(32) NOT NULL DEFAULT 'idle' COMMENT '历史补抓状态',
+                        cursor_verified TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否验证过 resume_next_time 可复用',
+                        last_page_count INT NOT NULL DEFAULT 0 COMMENT '最近一次补抓已翻页数',
+                        last_run_started_at DATETIME NULL COMMENT '最近一次历史补抓开始时间',
+                        last_run_finished_at DATETIME NULL COMMENT '最近一次历史补抓结束时间',
+                        last_error_message TEXT NULL COMMENT '最近一次错误',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+                        PRIMARY KEY (server_id, channel_id),
+                        KEY idx_history_oldest_time (oldest_covered_time_ms),
+                        KEY idx_history_status (status)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='历史抓取断点表'
                     """
                 )
                 self._ensure_messages_sender_role_schema(cursor)
@@ -1527,7 +1808,7 @@ class MySQLStorage(MessageStorage):
                     )
                     return list(cursor.fetchall())
             except Exception:
-                logger.error("获取房间消息失败 room_id=%s: %s", room_id, exc_info=True)
+                logger.error("获取房间消息失败 room_id=%s", room_id, exc_info=True)
                 raise
 
     def get_latest_message(self, room_id: str) -> Optional[Dict[str, Any]]:
@@ -1559,7 +1840,201 @@ class MySQLStorage(MessageStorage):
                     )
                     return cursor.fetchone()
             except Exception:
-                logger.error("获取最新消息失败 room_id=%s: %s", room_id, exc_info=True)
+                logger.error("获取最新消息失败 room_id=%s", room_id, exc_info=True)
+                raise
+
+    def get_history_checkpoint(
+        self, server_id: int, channel_id: int
+    ) -> Optional[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT
+                            server_id,
+                            channel_id,
+                            oldest_covered_message_id,
+                            oldest_covered_time_ms,
+                            resume_next_time,
+                            target_time_ms,
+                            status,
+                            cursor_verified,
+                            last_page_count,
+                            last_run_started_at,
+                            last_run_finished_at,
+                            last_error_message,
+                            created_at,
+                            updated_at
+                        FROM crawl_history_checkpoints
+                        WHERE server_id = %s AND channel_id = %s
+                        LIMIT 1
+                    """,
+                        (server_id, channel_id),
+                    )
+                    row = cursor.fetchone()
+                    if not row:
+                        return None
+                    row["cursor_verified"] = bool(row.get("cursor_verified"))
+                    return row
+            except Exception:
+                logger.error(
+                    "获取历史抓取断点失败 server_id=%s channel_id=%s: %s",
+                    server_id,
+                    channel_id,
+                    exc_info=True,
+                )
+                raise
+
+    def start_history_fetch(
+        self, server_id: int, channel_id: int, target_time_ms: int
+    ) -> None:
+        with self._get_conn() as conn:
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO crawl_history_checkpoints (
+                            server_id, channel_id, target_time_ms, status,
+                            last_page_count, last_run_started_at, last_run_finished_at,
+                            last_error_message
+                        ) VALUES (%s, %s, %s, 'running', 0, NOW(), NULL, NULL)
+                        ON DUPLICATE KEY UPDATE
+                            target_time_ms = VALUES(target_time_ms),
+                            status = 'running',
+                            last_page_count = 0,
+                            last_run_started_at = NOW(),
+                            last_run_finished_at = NULL,
+                            last_error_message = NULL,
+                            updated_at = CURRENT_TIMESTAMP
+                    """,
+                        (server_id, channel_id, target_time_ms),
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def update_history_checkpoint_progress(
+        self,
+        server_id: int,
+        channel_id: int,
+        oldest_covered_message_id: Optional[str],
+        oldest_covered_time_ms: Optional[int],
+        resume_next_time: Optional[int],
+        last_page_count: int,
+        cursor_verified: Optional[bool] = None,
+    ) -> None:
+        with self._get_conn() as conn:
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        UPDATE crawl_history_checkpoints
+                        SET oldest_covered_message_id = COALESCE(%s, oldest_covered_message_id),
+                            oldest_covered_time_ms = COALESCE(%s, oldest_covered_time_ms),
+                            resume_next_time = %s,
+                            status = 'running',
+                            cursor_verified = COALESCE(%s, cursor_verified),
+                            last_page_count = %s,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE server_id = %s AND channel_id = %s
+                    """,
+                        (
+                            oldest_covered_message_id,
+                            oldest_covered_time_ms,
+                            resume_next_time,
+                            None if cursor_verified is None else int(cursor_verified),
+                            last_page_count,
+                            server_id,
+                            channel_id,
+                        ),
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def finish_history_fetch_success(
+        self,
+        server_id: int,
+        channel_id: int,
+        target_time_ms: int,
+        oldest_covered_message_id: Optional[str],
+        oldest_covered_time_ms: Optional[int],
+        resume_next_time: Optional[int],
+        last_page_count: int,
+        cursor_verified: Optional[bool] = None,
+    ) -> None:
+        with self._get_conn() as conn:
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        UPDATE crawl_history_checkpoints
+                        SET target_time_ms = %s,
+                            oldest_covered_message_id = COALESCE(%s, oldest_covered_message_id),
+                            oldest_covered_time_ms = COALESCE(%s, oldest_covered_time_ms),
+                            resume_next_time = %s,
+                            status = 'success',
+                            cursor_verified = COALESCE(%s, cursor_verified),
+                            last_page_count = %s,
+                            last_run_finished_at = NOW(),
+                            last_error_message = NULL,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE server_id = %s AND channel_id = %s
+                    """,
+                        (
+                            target_time_ms,
+                            oldest_covered_message_id,
+                            oldest_covered_time_ms,
+                            resume_next_time,
+                            None if cursor_verified is None else int(cursor_verified),
+                            last_page_count,
+                            server_id,
+                            channel_id,
+                        ),
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def finish_history_fetch_failed(
+        self,
+        server_id: int,
+        channel_id: int,
+        status: str,
+        error_message: Optional[str],
+        resume_next_time: Optional[int],
+        last_page_count: int,
+    ) -> None:
+        with self._get_conn() as conn:
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        UPDATE crawl_history_checkpoints
+                        SET status = %s,
+                            resume_next_time = %s,
+                            last_page_count = %s,
+                            last_run_finished_at = NOW(),
+                            last_error_message = %s,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE server_id = %s AND channel_id = %s
+                    """,
+                        (
+                            status,
+                            resume_next_time,
+                            last_page_count,
+                            error_message,
+                            server_id,
+                            channel_id,
+                        ),
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
                 raise
 
     def export_messages(
@@ -1599,7 +2074,7 @@ class MySQLStorage(MessageStorage):
                     cursor.execute(query, params)
                     messages = list(cursor.fetchall())
             except Exception:
-                logger.error("导出消息失败 room_id=%s: %s", room_id, exc_info=True)
+                logger.error("导出消息失败 room_id=%s", room_id, exc_info=True)
                 raise
 
         if output_format == "json":
@@ -1718,7 +2193,7 @@ class MySQLStorage(MessageStorage):
                     """)
                     top_rooms_rows = cursor.fetchall()
             except Exception:
-                logger.error("获取统计信息失败: %s", exc_info=True)
+                logger.error("获取统计信息失败", exc_info=True)
                 raise
 
         return {
@@ -1745,7 +2220,7 @@ class MySQLStorage(MessageStorage):
                     """)
                     return list(cursor.fetchall())
             except Exception:
-                logger.error("获取房间列表失败: %s", exc_info=True)
+                logger.error("获取房间列表失败", exc_info=True)
                 raise
 
     def list_senders(self, room_id: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -1889,7 +2364,7 @@ class MySQLStorage(MessageStorage):
                     items = list(cursor.fetchall())
                     return {"total": total, "items": items}
             except Exception:
-                logger.error("搜索消息失败: %s", exc_info=True)
+                logger.error("搜索消息失败", exc_info=True)
                 raise
 
     def get_message_detail(self, message_id: str) -> Optional[Dict[str, Any]]:
@@ -1956,7 +2431,7 @@ class MySQLStorage(MessageStorage):
                     )
                     return list(cursor.fetchall())
             except Exception:
-                logger.error("获取成员列表失败: %s", exc_info=True)
+                logger.error("获取成员列表失败", exc_info=True)
                 raise
 
     def get_top_member_for_day(self, start_time_ms: int) -> Optional[Dict[str, Any]]:
@@ -1992,7 +2467,7 @@ class MySQLStorage(MessageStorage):
                         "message_count": row["message_count"],
                     }
             except Exception:
-                logger.error("查询当日活跃成员失败: %s", exc_info=True)
+                logger.error("查询当日活跃成员失败", exc_info=True)
                 raise
 
 

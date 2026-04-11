@@ -27,19 +27,37 @@ from message_storage import (
 
 log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "logs")
 os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, "scraper.log")
-rotating_handler = logging.handlers.RotatingFileHandler(
-    log_file, encoding="utf-8", mode="w", maxBytes=10 * 1024 * 1024, backupCount=3
-)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        rotating_handler,
-        logging.StreamHandler(),
-    ],
-)
+DEFAULT_LOG_FILE = os.path.join(log_dir, "scraper.log")
+ONCE_LOG_FILE = os.path.join(log_dir, "scraper_once.log")
 logger = logging.getLogger(__name__)
+
+
+def _configure_logging(for_once: bool = False) -> None:
+    if for_once:
+        file_handler = logging.FileHandler(
+            ONCE_LOG_FILE,
+            encoding="utf-8",
+            mode="w",
+        )
+    else:
+        file_handler = logging.handlers.TimedRotatingFileHandler(
+            DEFAULT_LOG_FILE,
+            when="midnight",
+            interval=1,
+            backupCount=14,
+            encoding="utf-8",
+        )
+        file_handler.suffix = "%Y-%m-%d"
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=[
+            file_handler,
+            logging.StreamHandler(),
+        ],
+        force=True,
+    )
 
 
 def _setup_console_encoding():
@@ -97,6 +115,14 @@ def _member_display_name(member: Dict[str, Any]) -> str:
         or member.get("channelId")
         or "-"
     )
+
+
+def _format_time_ms(timestamp_ms: Optional[int]) -> str:
+    if timestamp_ms is None:
+        return "N/A"
+    from datetime import datetime
+
+    return datetime.fromtimestamp(timestamp_ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -513,14 +539,15 @@ class Pocket48Client:
             logger.error("Login error: %s", exc)
             return False
 
-    def get_room_messages(
-        self, member: Dict[str, Any], limit: int = 100, next_time: int = 0
-    ) -> Dict[str, Any]:
+    def ensure_authenticated(self) -> None:
         if not self.login():
             raise AuthenticationUnavailableError(
                 self.password_login_blocked_reason or "未登录或缺少有效 token"
             )
 
+    def get_room_messages(
+        self, member: Dict[str, Any], limit: int = 100, next_time: int = 0
+    ) -> Dict[str, Any]:
         server_id = member.get("serverId")
         channel_id = member.get("channelId")
         if server_id is None or channel_id is None:
@@ -679,18 +706,95 @@ class Pocket48Client:
             if self._is_message_newer_than_local(msg, latest_local)
         ]
 
-    def fetch_incremental_messages(
+    def _history_target_already_covered(
+        self, checkpoint: Optional[Dict[str, Any]], target_time_ms: int
+    ) -> bool:
+        if not checkpoint:
+            return False
+        oldest_covered_time_ms = checkpoint.get("oldest_covered_time_ms")
+        return (
+            oldest_covered_time_ms is not None
+            and int(oldest_covered_time_ms) <= target_time_ms
+        )
+
+    def _resolve_history_fetch_start(
+        self, checkpoint: Optional[Dict[str, Any]]
+    ) -> tuple[int, bool, bool]:
+        if not checkpoint or not checkpoint.get("resume_next_time"):
+            return 0, False, False
+
+        resume_next_time = int(checkpoint["resume_next_time"])
+        if checkpoint.get("cursor_verified"):
+            return resume_next_time, True, False
+        return resume_next_time, False, True
+
+    def _verify_history_cursor_page(
+        self,
+        checkpoint: Optional[Dict[str, Any]],
+        result: Dict[str, Any],
+        requested_next_time: int,
+    ) -> bool:
+        if requested_next_time <= 0:
+            return False
+        if result.get("raw_count", 0) <= 0:
+            return False
+        if result.get("next_time") == requested_next_time:
+            return False
+
+        if checkpoint is None:
+            return True
+
+        expected_oldest_time_ms = checkpoint.get("oldest_covered_time_ms")
+        newest_raw_timestamp = result.get("newest_raw_timestamp")
+        if (
+            expected_oldest_time_ms is not None
+            and newest_raw_timestamp is not None
+            and newest_raw_timestamp > int(expected_oldest_time_ms) + 6 * 60 * 60 * 1000
+        ):
+            return False
+        return True
+
+    def _persist_history_progress_if_needed(
+        self,
+        member: Dict[str, Any],
+        page_count: int,
+        oldest_covered_message_id: Optional[str],
+        oldest_covered_time_ms: Optional[int],
+        resume_next_time: Optional[int],
+        cursor_verified: Optional[bool] = None,
+        force: bool = False,
+    ) -> None:
+        if not force and page_count % 5 != 0:
+            return
+
+        server_id = member.get("serverId")
+        channel_id = member.get("channelId")
+        if server_id is None or channel_id is None:
+            return
+
+        self.storage.update_history_checkpoint_progress(
+            server_id=int(server_id),
+            channel_id=int(channel_id),
+            oldest_covered_message_id=oldest_covered_message_id,
+            oldest_covered_time_ms=oldest_covered_time_ms,
+            resume_next_time=resume_next_time,
+            last_page_count=page_count,
+            cursor_verified=cursor_verified,
+        )
+
+    def fetch_latest_incremental_messages(
         self,
         member: Dict[str, Any],
         limit: int = 100,
-        since_time_ms: Optional[int] = None,
         max_pages: Optional[int] = None,
         page_delay: float = 1.0,
     ) -> List[Dict[str, Any]]:
+        self.ensure_authenticated()
         room_id = str(member.get("channelId"))
         room_name = _member_display_name(member)
         latest_local = self._get_latest_local_message(room_id)
-        if latest_local is None and since_time_ms is None:
+        since_time_ms = None
+        if latest_local is None:
             # 首次抓取没有本地边界时，默认只回溯最近 30 天，避免无限追历史。
             since_time_ms = int((time.time() - 30 * 24 * 60 * 60) * 1000)
         next_time = 0
@@ -737,14 +841,6 @@ class Pocket48Client:
                     should_stop = True
                     continue
 
-                # 指定时间范围回补历史时，不能再用本地最新消息做停止边界，
-                # 否则会在第一页就因为“消息已存在”而提前停下，无法继续翻到更早日期。
-                if since_time_ms is not None:
-                    collected_messages.append(message)
-                    if message_id:
-                        seen_message_ids.add(message_id)
-                    continue
-
                 if self._is_same_message_as_local_boundary(message, latest_local):
                     should_stop = True
                     continue
@@ -774,14 +870,16 @@ class Pocket48Client:
                 oldest_str,
             )
             if should_stop:
-                logger.info("[%s] Stop: message time before target", room_name)
+                logger.info("[%s] Stop: local latest boundary reached", room_name)
                 break
             if (
                 since_time_ms is not None
                 and oldest_raw_timestamp is not None
                 and oldest_raw_timestamp <= since_time_ms
             ):
-                logger.info("[%s] Stop: reached target time", room_name)
+                logger.info(
+                    "[%s] Stop: reached initial 30-day protection boundary", room_name
+                )
                 break
             if not new_next_time:
                 logger.info("[%s] Stop: no more messages", room_name)
@@ -801,6 +899,314 @@ class Pocket48Client:
             total_time,
         )
         return collected_messages
+
+    def fetch_history_messages(
+        self,
+        member: Dict[str, Any],
+        target_time_ms: int,
+        limit: int = 100,
+        max_pages: Optional[int] = None,
+        page_delay: float = 1.0,
+    ) -> Dict[str, Any]:
+        self.ensure_authenticated()
+        room_id = member.get("channelId")
+        server_id = member.get("serverId")
+        room_name = _member_display_name(member)
+        if room_id is None or server_id is None:
+            raise ValueError("历史抓取需要 serverId 和 channelId")
+
+        checkpoint = self.storage.get_history_checkpoint(int(server_id), int(room_id))
+        if self._history_target_already_covered(checkpoint, target_time_ms):
+            logger.info(
+                "[%s] Skip history fetch: already covered to target %s (covered_to %s)",
+                room_name,
+                _format_time_ms(target_time_ms),
+                _format_time_ms(checkpoint.get("oldest_covered_time_ms"))
+                if checkpoint
+                else "N/A",
+            )
+            return {
+                "messages": [],
+                "page_count": 0,
+                "oldest_covered_message_id": checkpoint.get("oldest_covered_message_id")
+                if checkpoint
+                else None,
+                "oldest_covered_time_ms": checkpoint.get("oldest_covered_time_ms")
+                if checkpoint
+                else None,
+                "resume_next_time": checkpoint.get("resume_next_time")
+                if checkpoint
+                else None,
+                "reached_target": True,
+                "cursor_verified": bool(
+                    checkpoint and checkpoint.get("cursor_verified")
+                ),
+                "cursor_invalid": False,
+            }
+
+        self.storage.start_history_fetch(
+            server_id=int(server_id),
+            channel_id=int(room_id),
+            target_time_ms=target_time_ms,
+        )
+        logger.info(
+            "[%s] Start history fetch: target %s",
+            room_name,
+            _format_time_ms(target_time_ms),
+        )
+        checkpoint = self.storage.get_history_checkpoint(int(server_id), int(room_id))
+
+        next_time, using_resume_cursor, probing_resume_cursor = (
+            self._resolve_history_fetch_start(checkpoint)
+        )
+        seen_message_ids = set()
+        collected_messages: List[Dict[str, Any]] = []
+        page_count = 0
+        oldest_covered_time_ms = (
+            checkpoint.get("oldest_covered_time_ms") if checkpoint else None
+        )
+        oldest_covered_message_id = (
+            checkpoint.get("oldest_covered_message_id") if checkpoint else None
+        )
+        cursor_verified = bool(checkpoint and checkpoint.get("cursor_verified"))
+        cursor_invalid = False
+        completed_successfully = False
+        failure_status = "interrupted"
+        failure_message = "history fetch stopped before reaching target"
+        start_time = time.time()
+        from datetime import datetime
+
+        while True:
+            if max_pages is not None and page_count >= max_pages:
+                logger.info(
+                    "房间 %s(%s) 达到历史抓取最大分页数 %s，停止继续翻页",
+                    room_name,
+                    room_id,
+                    max_pages,
+                )
+                failure_message = f"reached max_pages={max_pages} before target"
+                break
+
+            requested_next_time = next_time
+            result = self.get_room_messages(
+                member, limit=limit, next_time=requested_next_time
+            )
+
+            if using_resume_cursor or probing_resume_cursor:
+                if not self._verify_history_cursor_page(
+                    checkpoint, result, requested_next_time
+                ):
+                    cursor_invalid = True
+                    logger.warning(
+                        "[%s] Saved history cursor became invalid, fallback to latest page",
+                        room_name,
+                    )
+                    self.storage.finish_history_fetch_failed(
+                        server_id=int(server_id),
+                        channel_id=int(room_id),
+                        status="invalid_cursor",
+                        error_message="saved history cursor became invalid",
+                        resume_next_time=requested_next_time,
+                        last_page_count=page_count,
+                    )
+                    self.storage.start_history_fetch(
+                        server_id=int(server_id),
+                        channel_id=int(room_id),
+                        target_time_ms=target_time_ms,
+                    )
+                    checkpoint = self.storage.get_history_checkpoint(
+                        int(server_id), int(room_id)
+                    )
+                    next_time = 0
+                    using_resume_cursor = False
+                    probing_resume_cursor = False
+                    cursor_verified = False
+                    continue
+
+                if probing_resume_cursor:
+                    logger.info(
+                        "[%s] Resume history cursor verified and promoted", room_name
+                    )
+                else:
+                    logger.info("[%s] Resume history cursor accepted", room_name)
+
+            page_messages = result["messages"]
+            raw_count = result.get("raw_count", 0)
+            oldest_raw_timestamp = result.get("oldest_raw_timestamp")
+            page_count += 1
+
+            if raw_count == 0:
+                completed_successfully = True
+                break
+
+            reached_target = False
+            for message in page_messages:
+                message_id = message.get("message_id")
+                message_timestamp = message.get("timestamp") or 0
+                if message_id and message_id in seen_message_ids:
+                    continue
+                if message_timestamp < target_time_ms:
+                    reached_target = True
+                    continue
+                collected_messages.append(message)
+                if message_id:
+                    seen_message_ids.add(message_id)
+
+            if oldest_raw_timestamp is not None and (
+                oldest_covered_time_ms is None
+                or oldest_raw_timestamp < oldest_covered_time_ms
+            ):
+                oldest_covered_time_ms = oldest_raw_timestamp
+
+            page_message_candidates = [
+                msg
+                for msg in page_messages
+                if (msg.get("timestamp") or 0) >= target_time_ms
+                and msg.get("message_id")
+            ]
+            if page_message_candidates:
+                oldest_message = min(
+                    page_message_candidates, key=lambda item: item.get("timestamp") or 0
+                )
+                oldest_covered_message_id = oldest_message.get("message_id")
+
+            new_next_time = result["next_time"]
+            elapsed = time.time() - start_time
+            oldest_str = (
+                datetime.fromtimestamp(oldest_raw_timestamp / 1000).strftime(
+                    "%m-%d %H:%M"
+                )
+                if oldest_raw_timestamp
+                else "N/A"
+            )
+            logger.info(
+                "[History %s] [collected %s] [elapsed %.0fs] [oldest %s]",
+                page_count,
+                len(collected_messages),
+                elapsed,
+                oldest_str,
+            )
+
+            if using_resume_cursor or probing_resume_cursor:
+                cursor_verified = True
+                using_resume_cursor = False
+                probing_resume_cursor = False
+
+            self._persist_history_progress_if_needed(
+                member=member,
+                page_count=page_count,
+                oldest_covered_message_id=oldest_covered_message_id,
+                oldest_covered_time_ms=oldest_covered_time_ms,
+                resume_next_time=new_next_time,
+                cursor_verified=cursor_verified,
+            )
+
+            if reached_target:
+                completed_successfully = True
+                logger.info("[%s] Stop: history target reached in page body", room_name)
+                next_time = new_next_time
+                break
+            if (
+                oldest_raw_timestamp is not None
+                and oldest_raw_timestamp <= target_time_ms
+            ):
+                completed_successfully = True
+                logger.info(
+                    "[%s] Stop: history target reached by raw boundary", room_name
+                )
+                next_time = new_next_time
+                break
+            if not new_next_time:
+                completed_successfully = True
+                logger.info("[%s] Stop: no more messages", room_name)
+                next_time = new_next_time
+                break
+            if new_next_time == requested_next_time:
+                completed_successfully = True
+                logger.info("[%s] Stop: pagination ended", room_name)
+                next_time = new_next_time
+                break
+
+            next_time = new_next_time
+            time.sleep(page_delay)
+
+        total_time = time.time() - start_time
+        logger.info(
+            "[%s] History done: %spages %smessages %.1fs [target %s] [covered_to %s]",
+            room_name,
+            page_count,
+            len(collected_messages),
+            total_time,
+            _format_time_ms(target_time_ms),
+            _format_time_ms(oldest_covered_time_ms),
+        )
+        self._persist_history_progress_if_needed(
+            member=member,
+            page_count=page_count,
+            oldest_covered_message_id=oldest_covered_message_id,
+            oldest_covered_time_ms=oldest_covered_time_ms,
+            resume_next_time=next_time,
+            cursor_verified=cursor_verified,
+            force=True,
+        )
+        if completed_successfully:
+            self.storage.finish_history_fetch_success(
+                server_id=int(server_id),
+                channel_id=int(room_id),
+                target_time_ms=target_time_ms,
+                oldest_covered_message_id=oldest_covered_message_id,
+                oldest_covered_time_ms=oldest_covered_time_ms,
+                resume_next_time=next_time,
+                last_page_count=page_count,
+                cursor_verified=cursor_verified,
+            )
+        else:
+            self.storage.finish_history_fetch_failed(
+                server_id=int(server_id),
+                channel_id=int(room_id),
+                status=failure_status,
+                error_message=failure_message,
+                resume_next_time=next_time,
+                last_page_count=page_count,
+            )
+        return {
+            "messages": collected_messages,
+            "page_count": page_count,
+            "oldest_covered_message_id": oldest_covered_message_id,
+            "oldest_covered_time_ms": oldest_covered_time_ms,
+            "resume_next_time": next_time,
+            "reached_target": (
+                oldest_covered_time_ms is not None
+                and oldest_covered_time_ms <= target_time_ms
+            ),
+            "cursor_verified": cursor_verified,
+            "cursor_invalid": cursor_invalid,
+        }
+
+    def fetch_incremental_messages(
+        self,
+        member: Dict[str, Any],
+        limit: int = 100,
+        since_time_ms: Optional[int] = None,
+        max_pages: Optional[int] = None,
+        page_delay: float = 1.0,
+    ) -> List[Dict[str, Any]]:
+        if since_time_ms is None:
+            return self.fetch_latest_incremental_messages(
+                member,
+                limit=limit,
+                max_pages=max_pages,
+                page_delay=page_delay,
+            )
+
+        history_result = self.fetch_history_messages(
+            member,
+            target_time_ms=since_time_ms,
+            limit=limit,
+            max_pages=max_pages,
+            page_delay=page_delay,
+        )
+        return history_result["messages"]
 
     def monitor_room(
         self,
@@ -986,6 +1392,29 @@ class MessageScraper:
         max_pages: Optional[int] = None,
         page_delay: float = 1.0,
     ):
+        if since_time_ms is None:
+            self._run_member_once_latest(
+                member,
+                fetch_limit=fetch_limit,
+                max_pages=max_pages,
+                page_delay=page_delay,
+            )
+            return
+        self._run_member_once_history(
+            member,
+            fetch_limit=fetch_limit,
+            target_time_ms=since_time_ms,
+            max_pages=max_pages,
+            page_delay=page_delay,
+        )
+
+    def _run_member_once_latest(
+        self,
+        member: Dict[str, Any],
+        fetch_limit: int,
+        max_pages: Optional[int] = None,
+        page_delay: float = 1.0,
+    ):
         room_id = member.get("channelId")
         server_id = member.get("serverId")
         room_name = _member_display_name(member)
@@ -996,10 +1425,9 @@ class MessageScraper:
             return
 
         try:
-            messages = self.client.fetch_incremental_messages(
+            messages = self.client.fetch_latest_incremental_messages(
                 member,
                 limit=fetch_limit,
-                since_time_ms=since_time_ms,
                 max_pages=max_pages,
                 page_delay=page_delay,
             )
@@ -1044,6 +1472,81 @@ class MessageScraper:
                 channel_id=room_id,
             )
             logger.error("One-time fetch error %s(%s): %s", room_name, room_id, exc)
+
+    def _run_member_once_history(
+        self,
+        member: Dict[str, Any],
+        fetch_limit: int,
+        target_time_ms: int,
+        max_pages: Optional[int] = None,
+        page_delay: float = 1.0,
+    ):
+        room_id = member.get("channelId")
+        server_id = member.get("serverId")
+        room_name = _member_display_name(member)
+        if room_id is None or server_id is None:
+            logger.warning(
+                "Skipping member config missing serverId/channelId: %s", member
+            )
+            return
+
+        try:
+            history_result = self.client.fetch_history_messages(
+                member,
+                target_time_ms=target_time_ms,
+                limit=fetch_limit,
+                max_pages=max_pages,
+                page_delay=page_delay,
+            )
+            messages = history_result["messages"]
+            saved = self.client.save_messages(messages) if messages else 0
+            self.client.storage.record_fetch(
+                room_id=str(room_id),
+                messages_count=saved,
+                status="success",
+                server_id=server_id,
+                channel_id=room_id,
+            )
+            logger.info(
+                "One-time history fetch %s(%s): fetched %s, saved %s, pages %s, target %s, covered_to %s",
+                room_name,
+                room_id,
+                len(messages),
+                saved,
+                history_result["page_count"],
+                _format_time_ms(target_time_ms),
+                _format_time_ms(history_result["oldest_covered_time_ms"]),
+            )
+        except KeyboardInterrupt:
+            self.client.storage.finish_history_fetch_failed(
+                server_id=int(server_id),
+                channel_id=int(room_id),
+                status="interrupted",
+                error_message="history fetch interrupted by user",
+                resume_next_time=None,
+                last_page_count=0,
+            )
+            raise
+        except Exception as exc:
+            self.client.storage.finish_history_fetch_failed(
+                server_id=int(server_id),
+                channel_id=int(room_id),
+                status="failed",
+                error_message=str(exc),
+                resume_next_time=None,
+                last_page_count=0,
+            )
+            self.client.storage.record_fetch(
+                room_id=str(room_id),
+                messages_count=0,
+                status="failed",
+                error_message=str(exc),
+                server_id=server_id,
+                channel_id=room_id,
+            )
+            logger.error(
+                "One-time history fetch error %s(%s): %s", room_name, room_id, exc
+            )
 
     def run_once(
         self,
@@ -1160,6 +1663,7 @@ def main():
     )
     parser.add_argument("--stats", action="store_true", help="Show scrape statistics")
     args = parser.parse_args()
+    _configure_logging(for_once=args.once)
 
     try:
         scraper = MessageScraper(args.config)

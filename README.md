@@ -162,7 +162,7 @@ pip install -r requirements.txt
 `src/pocket48_scraper.py` 现在是统一入口，抓取、导出、统计都从这里执行。
 
 持续抓取模式下，`config/config.json` 里的 `monitor.max_pages` 用来限制每个房间单轮最多翻多少页，默认示例值为 `5`。
-单次抓取模式下，如果你传了 `--since-days` 但没有显式传 `--max-pages`，程序会自动使用 `monitor.since_days_max_pages` 作为保护值；默认示例值为 `20`，避免高活跃房间翻页过深。
+单次抓取模式下，`--since-days` 现在使用独立的历史补抓断点；如果本地已经完整覆盖到目标时间，会直接跳过该房间的历史补抓。`--max-pages` 仍可作为单次执行的安全保护值，但不再有 `monitor.since_days_max_pages` 这种自动兜底页数。
 
 ```bash
 python src/pocket48_scraper.py -c config/config.json
@@ -194,13 +194,36 @@ python src/pocket48_scraper.py -c config/config.json --stats
 - 如果本地最新消息还没有追上接口返回的数据边界，程序会继续使用返回的 `nextTime` 向历史翻页
 - 分页会持续到命中本地已保存的最新消息，或接口没有更多历史页为止
 - 如果某个房间本地还没有历史数据，且你没有显式传入 `--since-days`，脚本默认只回溯最近 30 天
-- 如果你希望手动限制范围，可以传 `--since-days`，例如 `--since-days 2` 表示只抓最近 2 天
-- 如果你希望限制单次执行的翻页深度，可以传 `--max-pages`，例如 `--max-pages 20` 表示最多翻 20 页
+- 如果你希望手动限制范围，可以传 `--since-days`，例如 `--since-days 2` 表示补抓最近 2 天的历史范围
+- `--since-days` 会把历史覆盖进度记录到 `crawl_history_checkpoints`；下次补更长历史时，会先检查本地是否已经覆盖到目标时间
+- 历史补抓默认每 5 页更新一次历史断点；如果存在未验证的 `nextTime` 游标，程序会先做一次探测校验，校验通过后自动把该房间提升为 `cursor_verified=1`，后续再直接用于续翻
+- 如果你希望限制单次执行的翻页深度，可以传 `--max-pages`，例如 `--max-pages 20` 表示最多翻 20 页；如果在达到目标时间之前提前触发这个保护值，历史断点会记录为未完成状态
 - 如果你要补更早历史，可以显式提高 `--max-pages`
 - 持续抓取模式不会读取命令行里的 `--max-pages`，而是读取配置文件中的 `monitor.max_pages`；这个值越小越省资源，但在高活跃房间里越可能需要多轮才能追平
 - 持续抓取模式下，如果某一轮没有抓到新消息，程序不会每轮都写一条成功记录，而是按 `monitor.success_heartbeat_every` 的配置做心跳采样；默认每空轮询 `10` 轮写一次 `crawl_tasks`
 - 如果你更看重数据库轻量运行，可以把 `monitor.success_heartbeat_every` 调大；如果你更看重抓取审计密度，可以把它调小
 - 这比只抓单页更适合持久化增量抓取，但是否绝对不漏仍取决于服务端分页与接口稳定性
+
+### 历史断点字段
+
+- `crawl_checkpoints.last_message_id` / `last_message_time_ms`：最新增量抓取断点，只用于判断“从最新页开始往回”是否已经追平
+- `crawl_history_checkpoints.oldest_covered_message_id`：当前已连续覆盖的最老成员消息 ID
+- `crawl_history_checkpoints.oldest_covered_time_ms`：当前已连续覆盖到的最老时间戳；判断某个 `--since-days` 是否已经补完时，主要看这个字段
+- `crawl_history_checkpoints.resume_next_time`：下次历史补抓优先尝试的 `nextTime` 游标
+- `crawl_history_checkpoints.target_time_ms`：最近一次历史补抓想覆盖到的目标时间
+- `crawl_history_checkpoints.status`：历史补抓状态，可能值包括 `running`、`success`、`interrupted`、`invalid_cursor`、`failed`
+- `crawl_history_checkpoints.cursor_verified`：是否已经验证过 `resume_next_time` 可复用；只有验证通过后，后续运行才会直接依赖这个游标续翻
+- `crawl_history_checkpoints.last_page_count`：最近一次历史补抓已翻页数
+- `crawl_history_checkpoints.last_run_started_at` / `last_run_finished_at`：最近一次历史补抓开始和结束时间
+- `crawl_history_checkpoints.last_error_message`：最近一次历史补抓失败原因或降级原因
+
+### 日志文件
+
+- 持续抓取模式日志：`data/logs/scraper.log`
+- 持续抓取历史日志：`data/logs/scraper.log.YYYY-MM-DD`
+- 单次抓取 `--once` 日志：`data/logs/scraper_once.log`
+- 持续抓取使用按天滚动并保留最近 14 份历史日志；服务重启不会覆盖当天的 `scraper.log`
+- 单次抓取日志仍按单次执行覆盖写入，便于单独排查历史补抓和一次性任务
 
 ### 6. 导出已抓取消息
 

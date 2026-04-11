@@ -141,3 +141,24 @@ CREATE TABLE `crawl_checkpoints` (
   PRIMARY KEY (`server_id`, `channel_id`),
   KEY `idx_crawl_checkpoints_last_message_time_ms` (`last_message_time_ms`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='抓取断点表';
+
+
+CREATE TABLE `crawl_history_checkpoints` (
+  `server_id` BIGINT NOT NULL COMMENT '房间 server_id',
+  `channel_id` BIGINT NOT NULL COMMENT '房间 channel_id',
+  `oldest_covered_message_id` VARCHAR(128) DEFAULT NULL COMMENT '已连续覆盖的最老成员消息ID',
+  `oldest_covered_time_ms` BIGINT DEFAULT NULL COMMENT '已连续覆盖的最老时间戳',
+  `resume_next_time` BIGINT DEFAULT NULL COMMENT '下次历史续翻优先尝试的 nextTime',
+  `target_time_ms` BIGINT DEFAULT NULL COMMENT '本次历史补抓目标时间',
+  `status` VARCHAR(32) NOT NULL DEFAULT 'idle' COMMENT '历史补抓状态',
+  `cursor_verified` TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否验证过 resume_next_time 可复用',
+  `last_page_count` INT NOT NULL DEFAULT 0 COMMENT '最近一次补抓已翻页数',
+  `last_run_started_at` DATETIME DEFAULT NULL COMMENT '最近一次历史补抓开始时间',
+  `last_run_finished_at` DATETIME DEFAULT NULL COMMENT '最近一次历史补抓结束时间',
+  `last_error_message` TEXT DEFAULT NULL COMMENT '最近一次错误',
+  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  PRIMARY KEY (`server_id`, `channel_id`),
+  KEY `idx_history_oldest_time` (`oldest_covered_time_ms`),
+  KEY `idx_history_status` (`status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='历史抓取断点表';
