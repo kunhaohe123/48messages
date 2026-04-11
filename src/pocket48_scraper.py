@@ -64,6 +64,8 @@ DEFAULT_CONFIG_PATH = "config/config.json"
 DEFAULT_TOKEN_PATH = "data/runtime/token.json"
 DEFAULT_MEMBERS_FILENAME = "members.json"
 DEFAULT_SINCE_DAYS_MAX_PAGES = 20
+DEFAULT_TOKEN_TTL_SECONDS = 86400
+DEFAULT_TOKEN_REFRESH_TTL_SECONDS = 6 * 60 * 60
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -121,8 +123,72 @@ def load_config(config_path: str) -> Dict[str, Any]:
     return config
 
 
+class ServerChanNotifier:
+    """发送微信告警，并在故障恢复前避免重复提醒。"""
+
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        notify_config = config or {}
+        self.sendkey = str(notify_config.get("sendkey") or "").strip()
+        self.enabled = bool(notify_config.get("enabled") and self.sendkey)
+        self.timeout = self._safe_int(notify_config.get("timeout", 10), 10)
+        self._active_events = set()
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _safe_int(value: Any, default: int) -> int:
+        try:
+            return max(int(value), 1)
+        except (TypeError, ValueError):
+            return default
+
+    def send_problem(self, event_key: str, title: str, desp: str):
+        if not self.enabled:
+            return
+
+        with self._lock:
+            if event_key in self._active_events:
+                logger.info("Skip duplicate active alert: %s", event_key)
+                return
+            self._active_events.add(event_key)
+
+        try:
+            response = requests.post(
+                f"https://sctapi.ftqq.com/{self.sendkey}.send",
+                data={"title": title, "desp": desp},
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            logger.info("ServerChan alert sent: %s", event_key)
+        except Exception as exc:
+            logger.error("ServerChan alert failed %s: %s", event_key, exc)
+
+    def send_recovery(self, event_key: str, title: str, desp: str):
+        if not self.enabled:
+            return
+
+        with self._lock:
+            if event_key not in self._active_events:
+                return
+            self._active_events.remove(event_key)
+
+        try:
+            response = requests.post(
+                f"https://sctapi.ftqq.com/{self.sendkey}.send",
+                data={"title": title, "desp": desp},
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            logger.info("ServerChan recovery sent: %s", event_key)
+        except Exception as exc:
+            logger.error("ServerChan recovery failed %s: %s", event_key, exc)
+
+
+class AuthenticationUnavailableError(RuntimeError):
+    """当前没有可用认证信息，但服务应继续等待人工恢复。"""
+
+
 class TokenManager:
-    """负责本地缓存 token，并在过期后让上层重新登录。"""
+    """负责本地缓存 token，并维护本地过期时间。"""
 
     def __init__(self, token_file: str = DEFAULT_TOKEN_PATH):
         self.token_file = resolve_project_path(token_file)
@@ -140,22 +206,48 @@ class TokenManager:
         with open(self.token_file, "w", encoding="utf-8") as file:
             json.dump(self.token_data, file, ensure_ascii=False, indent=2)
 
-    def set_token(self, access_token: str, expires_in: int = 86400):
+    def reload(self):
+        self.token_data = self._load_token()
+
+    def set_token(self, access_token: str, expires_in: int = DEFAULT_TOKEN_TTL_SECONDS):
+        now = time.time()
         self.token_data = {
             "access_token": access_token,
-            "expires_at": time.time() + expires_in,
-            "acquired_at": time.time(),
+            "expires_at": now + expires_in,
+            "acquired_at": now,
         }
         self._save_token()
         logger.info("Token saved")
 
-    def get_token(self) -> Optional[str]:
+    def has_token(self) -> bool:
+        return bool(self.token_data.get("access_token"))
+
+    def is_expired(self) -> bool:
+        if not self.has_token():
+            return True
+        return time.time() >= self.token_data.get("expires_at", 0)
+
+    def get_token(self, allow_expired: bool = False) -> Optional[str]:
         if not self.token_data:
             return None
-        if time.time() >= self.token_data.get("expires_at", 0):
+        if not allow_expired and self.is_expired():
             logger.warning("Token expired")
             return None
         return self.token_data.get("access_token")
+
+    def refresh_expiry(
+        self, expires_in: int = DEFAULT_TOKEN_REFRESH_TTL_SECONDS
+    ) -> bool:
+        if not self.has_token():
+            return False
+        new_expires_at = time.time() + expires_in
+        old_expires_at = self.token_data.get("expires_at", 0)
+        if new_expires_at <= old_expires_at:
+            return False
+        self.token_data["expires_at"] = new_expires_at
+        self._save_token()
+        logger.info("Token expiry refreshed")
+        return True
 
     def clear(self):
         self.token_data = {}
@@ -169,16 +261,19 @@ class Pocket48Client:
     """封装配置加载、登录、消息抓取和存储访问。"""
 
     def __init__(self, config_path: str = DEFAULT_CONFIG_PATH):
+        self.config_path = config_path
         self.config = load_config(config_path)
         self._thread_local = threading.local()
         self.storage = self._init_storage()
         self.storage.sync_members(self.config.get("members", []))
+        self.notifier = ServerChanNotifier(self.config.get("notify", {}))
+        self.password_login_blocked_reason: Optional[str] = None
         token_file = self.config.get("storage", {}).get(
             "token_file", DEFAULT_TOKEN_PATH
         )
         self.token_manager = TokenManager(token_file)
         configured_token = self.config.get("pocket48", {}).get("token")
-        if configured_token and not self.token_manager.get_token():
+        if configured_token and not self.token_manager.has_token():
             self.token_manager.set_token(configured_token)
 
     def _get_session(self) -> requests.Session:
@@ -223,10 +318,63 @@ class Pocket48Client:
         return f"{base_url}{path}"
 
     def _get_authenticated_headers(self) -> Dict[str, str]:
-        token = self.token_manager.get_token()
+        token = self.token_manager.get_token(allow_expired=True)
         if not token:
             raise RuntimeError("未登录或缺少有效 token")
         return {"token": token}
+
+    def _token_refresh_ttl_seconds(self) -> int:
+        configured = self.config.get("storage", {}).get(
+            "token_refresh_ttl_seconds", DEFAULT_TOKEN_REFRESH_TTL_SECONDS
+        )
+        try:
+            return max(int(configured), 600)
+        except (TypeError, ValueError):
+            return DEFAULT_TOKEN_REFRESH_TTL_SECONDS
+
+    def _token_retry_interval_seconds(self) -> int:
+        configured = self.config.get("monitor", {}).get("token_retry_interval", 60)
+        try:
+            return max(int(configured), 10)
+        except (TypeError, ValueError):
+            return 60
+
+    def reload_auth_state(self):
+        self.config = load_config(str(resolve_project_path(self.config_path)))
+        self.notifier = ServerChanNotifier(self.config.get("notify", {}))
+        self.token_manager.reload()
+        self._setup_session(self._get_session())
+        configured_token = self.config.get("pocket48", {}).get("token")
+        if configured_token and not self.token_manager.has_token():
+            self.token_manager.set_token(configured_token)
+
+    def _block_password_login(self, reason: str):
+        self.password_login_blocked_reason = reason
+        logger.warning("Password login blocked until manual token refresh: %s", reason)
+        self.notifier.send_problem(
+            event_key="password-login-blocked",
+            title="48messages 告警：需要手动更新 token",
+            desp=(f"自动密码登录已被禁用，请更新抓包 token。\n\n> 原因: {reason}"),
+        )
+
+    def _mark_token_accepted(self):
+        self.password_login_blocked_reason = None
+        self.token_manager.refresh_expiry(self._token_refresh_ttl_seconds())
+        self.notifier.send_recovery(
+            event_key="saved-token-rejected",
+            title="48messages 恢复：token 已恢复",
+            desp="服务端重新接受了当前 token，抓取已恢复。",
+        )
+        self.notifier.send_recovery(
+            event_key="automatic-password-login-disabled",
+            title="48messages 恢复：认证已恢复",
+            desp="检测到可用 token，自动等待状态已解除，抓取已恢复。",
+        )
+        self.notifier.send_recovery(
+            event_key="password-login-blocked",
+            title="48messages 恢复：token 已更新",
+            desp="检测到新的可用 token，手动更新流程已完成，抓取已恢复。",
+        )
 
     def _is_message_newer_than_local(
         self, message: Dict[str, Any], latest_local: Optional[Dict[str, Any]]
@@ -254,6 +402,29 @@ class Pocket48Client:
         if self.token_manager.get_token():
             logger.info("Using saved token")
             return True
+
+        stale_token = self.token_manager.get_token(allow_expired=True)
+        if stale_token:
+            logger.warning(
+                "Local token expiry reached, but saved token still exists; "
+                "continuing to use it until the server rejects it"
+            )
+            return True
+
+        if self.password_login_blocked_reason:
+            self.notifier.send_problem(
+                event_key="automatic-password-login-disabled",
+                title="48messages 告警：自动密码登录已禁用",
+                desp=(
+                    "当前没有可用 token，且不会再自动尝试密码登录。\n\n"
+                    f"> 原因: {self.password_login_blocked_reason}"
+                ),
+            )
+            logger.error(
+                "No usable token and automatic password login is disabled: %s",
+                self.password_login_blocked_reason,
+            )
+            return False
 
         pocket48_config = self._pocket48_config()
         mobile = pocket48_config.get("mobile")
@@ -285,6 +456,9 @@ class Pocket48Client:
             data = response.json()
             if data.get("status") != 200 or not data.get("success"):
                 logger.error("Login failed: %s", data.get("message"))
+                self._block_password_login(
+                    data.get("message") or "password login rejected by server"
+                )
                 return False
 
             content = data.get("content", {})
@@ -296,6 +470,7 @@ class Pocket48Client:
             valid_time_minutes = content.get("userInfo", {}).get("validTime", 40)
             expires_in = max(int(valid_time_minutes) * 60, 600)
             self.token_manager.set_token(token, expires_in)
+            self.password_login_blocked_reason = None
 
             logger.info(
                 "登录成功: userId=%s", content.get("userInfo", {}).get("userId")
@@ -310,12 +485,9 @@ class Pocket48Client:
         self, member: Dict[str, Any], limit: int = 100, next_time: int = 0
     ) -> Dict[str, Any]:
         if not self.login():
-            return {
-                "messages": [],
-                "next_time": next_time,
-                "raw_count": 0,
-                "oldest_raw_timestamp": None,
-            }
+            raise AuthenticationUnavailableError(
+                self.password_login_blocked_reason or "未登录或缺少有效 token"
+            )
 
         server_id = member.get("serverId")
         channel_id = member.get("channelId")
@@ -353,6 +525,20 @@ class Pocket48Client:
 
             data = response.json()
             if data.get("status") != 200 or not data.get("success"):
+                message = data.get("message") or "unknown error"
+                if "token" in message.lower() or "登录" in message or "认证" in message:
+                    self.notifier.send_problem(
+                        event_key="saved-token-rejected",
+                        title="48messages 告警：saved token 已失效",
+                        desp=(
+                            "服务器拒绝了当前保存的 token，需要重新抓包更新。\n\n"
+                            f"> 返回信息: {message}"
+                        ),
+                    )
+                    self.token_manager.clear()
+                    self._block_password_login(
+                        f"saved token rejected by server: {message}"
+                    )
                 logger.error("Fetch failed: %s", data.get("message"))
                 return {
                     "messages": [],
@@ -404,6 +590,7 @@ class Pocket48Client:
                     }
                 )
 
+            self._mark_token_accepted()
             logger.info("Fetched %s member TEXT messages", len(normalized_messages))
             return {
                 "messages": normalized_messages,
@@ -415,8 +602,18 @@ class Pocket48Client:
 
         except requests.HTTPError as exc:
             if exc.response is not None and exc.response.status_code in {401, 403}:
-                logger.warning("Token expired, clearing and waiting for relogin")
+                self.notifier.send_problem(
+                    event_key="saved-token-rejected",
+                    title="48messages 告警：saved token 已失效",
+                    desp=(
+                        "服务器以 HTTP 401/403 拒绝了当前保存的 token，需要重新抓包更新。\n\n"
+                        f"> HTTP 状态码: {exc.response.status_code}"
+                    ),
+                )
                 self.token_manager.clear()
+                self._block_password_login(
+                    f"saved token rejected by server with HTTP {exc.response.status_code}"
+                )
             logger.error("Fetch message error: %s", exc)
             return {
                 "messages": [],
@@ -587,6 +784,7 @@ class Pocket48Client:
         )
 
         consecutive_failures = 0
+        token_retry_interval = self._token_retry_interval_seconds()
         while True:
             try:
                 messages = self.fetch_incremental_messages(
@@ -623,6 +821,17 @@ class Pocket48Client:
 
                 time.sleep(interval)
 
+            except AuthenticationUnavailableError as exc:
+                consecutive_failures = 0
+                logger.warning(
+                    "Auth unavailable for room %s(%s), retrying in %s seconds: %s",
+                    room_name,
+                    room_id,
+                    token_retry_interval,
+                    exc,
+                )
+                time.sleep(token_retry_interval)
+                self.reload_auth_state()
             except KeyboardInterrupt:
                 logger.info("Stop monitoring room %s(%s)", room_name, room_id)
                 break
@@ -645,6 +854,14 @@ class Pocket48Client:
                     channel_id=int(room_id),
                 )
                 if consecutive_failures >= max_retries:
+                    self.notifier.send_problem(
+                        event_key=f"room-monitor-failed:{room_id}",
+                        title=f"48messages 告警：{room_name} 连续抓取失败",
+                        desp=(
+                            f"房间 {room_name}({room_id}) 连续失败已达到 {consecutive_failures}/{max_retries}。\n\n"
+                            f"> 最近错误: {exc}"
+                        ),
+                    )
                     logger.error(
                         "Room %s(%s) consecutive failures reached limit, stopping monitor",
                         room_name,
@@ -685,10 +902,6 @@ class MessageScraper:
         return selected
 
     def run(self, member_names: Optional[List[str]] = None):
-        if not self.client.login():
-            logger.error("Login failed, exiting")
-            return
-
         members = self._select_members(member_names)
         monitor_config = self.config.get("monitor", {})
         if not members:

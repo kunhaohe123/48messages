@@ -34,13 +34,21 @@
     "user": "root",
     "password": "",
     "charset": "utf8mb4",
-    "token_file": "data/runtime/token.json"
+    "token_file": "data/runtime/token.json",
+    "token_refresh_ttl_seconds": 21600
   },
   "monitor": {
     "interval": 60,
+    "token_retry_interval": 60,
     "limit": 100,
     "max_pages": 5,
     "since_days_max_pages": 20,
     "enabled": true
+  },
+  "notify": {
+    "enabled": false,
+    "provider": "serverchan",
+    "sendkey": "SCTxxxxxxxxxxxxxxxxxxxxxxxx",
+    "timeout": 10
   }
 }
