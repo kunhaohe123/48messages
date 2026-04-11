@@ -357,6 +357,9 @@ class SQLiteStorage(MessageStorage):
             cursor.execute(
                 f"UPDATE messages SET sender_role = {_sqlite_sender_role_case_expression()} WHERE sender_role IS NULL OR sender_role = ''"
             )
+            cursor.execute(
+                f"UPDATE messages SET sender_role = {_sqlite_sender_role_case_expression()} WHERE sender_role = '{FAN_SENDER_ROLE}' AND ({_sqlite_sender_role_case_expression()} = '{MEMBER_SENDER_ROLE}')"
+            )
         cursor.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_messages_role_time
@@ -1090,6 +1093,9 @@ class MySQLStorage(MessageStorage):
             )
         cursor.execute(
             f"UPDATE messages SET sender_role = {_mysql_sender_role_case_expression()} WHERE sender_role IS NULL OR sender_role = ''"
+        )
+        cursor.execute(
+            f"UPDATE messages SET sender_role = {_mysql_sender_role_case_expression()} WHERE sender_role = '{FAN_SENDER_ROLE}' AND ({_mysql_sender_role_case_expression()} = '{MEMBER_SENDER_ROLE}')"
         )
         cursor.execute(
             """
