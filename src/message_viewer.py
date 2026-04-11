@@ -353,19 +353,22 @@ def render_layout(title: str, body: str) -> str:
 
         wrapper.appendChild(clearBtn);
 
-        fp.config.onChange.push(function(selectedDates) {{
-          clearBtn.style.display = selectedDates.length > 0 ? 'flex' : 'none';
-        }});
+        const syncClearButton = () => {{
+          const hasValue = fp.selectedDates.length > 0 || Boolean(targetInput.value);
+          clearBtn.style.display = hasValue ? 'flex' : 'none';
+        }};
 
-        fp.config.onReady.push(function() {{
-          clearBtn.style.display = targetInput.value ? 'flex' : 'none';
-        }});
+        fp.config.onChange.push(syncClearButton);
+        fp.config.onValueUpdate.push(syncClearButton);
+
+        // 这里是在 flatpickr 初始化完成后追加按钮，直接同步一次可避免查询后刷新页面时按钮丢失。
+        syncClearButton();
 
         clearBtn.addEventListener('click', (e) => {{
           e.preventDefault();
           e.stopPropagation();
           fp.clear();
-          clearBtn.style.display = 'none';
+          syncClearButton();
         }});
 
         clearBtn.addEventListener('mouseenter', () => {{
