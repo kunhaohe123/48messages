@@ -12,6 +12,7 @@ import logging.handlers
 import threading
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 from pathlib import Path
 
@@ -339,6 +340,13 @@ class Pocket48Client:
         except (TypeError, ValueError):
             return 60
 
+    def _success_heartbeat_every(self) -> int:
+        configured = self.config.get("monitor", {}).get("success_heartbeat_every", 10)
+        try:
+            return max(int(configured), 1)
+        except (TypeError, ValueError):
+            return 10
+
     def reload_auth_state(self):
         self.config = load_config(str(resolve_project_path(self.config_path)))
         self.notifier = ServerChanNotifier(self.config.get("notify", {}))
@@ -384,15 +392,39 @@ class Pocket48Client:
 
         latest_timestamp = latest_local.get("timestamp") or 0
         message_timestamp = message.get("timestamp") or 0
-        return message_timestamp > latest_timestamp
+        if message_timestamp > latest_timestamp:
+            return True
+        if message_timestamp < latest_timestamp:
+            return False
 
-    def _extract_user_from_ext(self, ext_info: str) -> Dict[str, Any]:
+        latest_message_id = str(latest_local.get("message_id") or "")
+        message_id = str(message.get("message_id") or "")
+        if not latest_message_id or not message_id:
+            return False
+        return message_id != latest_message_id
+
+    def _is_same_message_as_local_boundary(
+        self, message: Dict[str, Any], latest_local: Optional[Dict[str, Any]]
+    ) -> bool:
+        if not latest_local:
+            return False
+
+        latest_message_id = str(latest_local.get("message_id") or "")
+        message_id = str(message.get("message_id") or "")
+        if latest_message_id and message_id:
+            return message_id == latest_message_id
+
+        latest_timestamp = latest_local.get("timestamp") or 0
+        message_timestamp = message.get("timestamp") or 0
+        return latest_timestamp > 0 and latest_timestamp == message_timestamp
+
+    def _extract_user_from_ext(self, ext_info: Any) -> Dict[str, Any]:
         if not ext_info:
             return {}
         parsed = _parse_json_like(ext_info)
         return parsed.get("user", {}) if isinstance(parsed, dict) else {}
 
-    def _is_member_message(self, ext_info: str) -> bool:
+    def _is_member_message(self, ext_info: Any) -> bool:
         if not ext_info:
             return False
         parsed = _parse_json_like(ext_info)
@@ -568,11 +600,12 @@ class Pocket48Client:
                     ):
                         oldest_raw_timestamp = message_timestamp
                 ext_info = msg.get("extInfo", "")
-                if not self._is_member_message(ext_info):
+                parsed_ext_info = _parse_json_like(ext_info)
+                if not self._is_member_message(parsed_ext_info):
                     continue
                 if str(msg.get("msgType") or "") != "TEXT":
                     continue
-                user_info = self._extract_user_from_ext(ext_info)
+                user_info = self._extract_user_from_ext(parsed_ext_info)
                 normalized_messages.append(
                     {
                         "room_id": room_id,
@@ -712,6 +745,10 @@ class Pocket48Client:
                         seen_message_ids.add(message_id)
                     continue
 
+                if self._is_same_message_as_local_boundary(message, latest_local):
+                    should_stop = True
+                    continue
+
                 if self._is_message_newer_than_local(message, latest_local):
                     collected_messages.append(message)
                     if message_id:
@@ -784,7 +821,9 @@ class Pocket48Client:
         )
 
         consecutive_failures = 0
+        idle_success_count = 0
         token_retry_interval = self._token_retry_interval_seconds()
+        success_heartbeat_every = self._success_heartbeat_every()
         while True:
             try:
                 messages = self.fetch_incremental_messages(
@@ -809,14 +848,18 @@ class Pocket48Client:
                         "Room %s(%s) saved %s new messages", room_name, room_id, saved
                     )
                     consecutive_failures = 0
+                    idle_success_count = 0
                 else:
-                    self.storage.record_fetch(
-                        room_id=room_id,
-                        messages_count=0,
-                        status="success",
-                        server_id=server_id,
-                        channel_id=int(room_id),
-                    )
+                    idle_success_count += 1
+                    if idle_success_count >= success_heartbeat_every:
+                        self.storage.record_fetch(
+                            room_id=room_id,
+                            messages_count=0,
+                            status="success",
+                            server_id=server_id,
+                            channel_id=int(room_id),
+                        )
+                        idle_success_count = 0
                     consecutive_failures = 0
 
                 time.sleep(interval)
@@ -942,7 +985,6 @@ class MessageScraper:
         since_time_ms: Optional[int] = None,
         max_pages: Optional[int] = None,
         page_delay: float = 1.0,
-        semaphore: Optional[threading.Semaphore] = None,
     ):
         room_id = member.get("channelId")
         server_id = member.get("serverId")
@@ -954,9 +996,6 @@ class MessageScraper:
             return
 
         try:
-            if semaphore is not None:
-                # 用信号量限制并发成员数，避免一次性打太多请求。
-                semaphore.acquire()
             messages = self.client.fetch_incremental_messages(
                 member,
                 limit=fetch_limit,
@@ -1005,9 +1044,6 @@ class MessageScraper:
                 channel_id=room_id,
             )
             logger.error("One-time fetch error %s(%s): %s", room_name, room_id, exc)
-        finally:
-            if semaphore is not None:
-                semaphore.release()
 
     def run_once(
         self,
@@ -1046,25 +1082,20 @@ class MessageScraper:
             effective_page_delay,
         )
 
-        threads: List[threading.Thread] = []
-        semaphore = threading.Semaphore(worker_count)
-        for member in members:
-            thread = threading.Thread(
-                target=self._run_member_once,
-                args=(
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [
+                executor.submit(
+                    self._run_member_once,
                     member,
                     fetch_limit,
                     since_time_ms,
                     max_pages,
                     effective_page_delay,
-                    semaphore,
-                ),
-            )
-            thread.start()
-            threads.append(thread)
-
-        for thread in threads:
-            thread.join()
+                )
+                for member in members
+            ]
+            for future in as_completed(futures):
+                future.result()
 
     def export(
         self,

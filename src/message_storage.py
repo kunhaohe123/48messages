@@ -1402,19 +1402,6 @@ class MySQLStorage(MessageStorage):
         with self._get_conn() as conn:
             try:
                 with conn.cursor() as cursor:
-                    message_ids = [
-                        str(message.get("message_id") or "") for message in messages
-                    ]
-                    existing_message_ids: set[str] = set()
-                    if message_ids:
-                        placeholders = ", ".join(["%s"] * len(message_ids))
-                        cursor.execute(
-                            f"SELECT message_id FROM messages WHERE message_id IN ({placeholders})",
-                            message_ids,
-                        )
-                        existing_message_ids = {
-                            str(row["message_id"] or "") for row in cursor.fetchall()
-                        }
                     member_name_map = self._get_member_name_map(
                         cursor,
                         [_message_server_id(message) for message in messages],
@@ -1448,10 +1435,7 @@ class MySQLStorage(MessageStorage):
                                 0,
                             )
                         )
-                        if (
-                            message_id not in existing_message_ids
-                            and message_id not in pending_payload_message_ids
-                        ):
+                        if message_id not in pending_payload_message_ids:
                             payload = _extract_media_fields(
                                 message.get("content"), message.get("ext_info")
                             )
@@ -1550,6 +1534,19 @@ class MySQLStorage(MessageStorage):
         with self._get_conn() as conn:
             try:
                 with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT last_message_id AS message_id, last_message_time_ms AS timestamp
+                        FROM crawl_checkpoints
+                        WHERE channel_id = %s
+                        LIMIT 1
+                    """,
+                        (room_id,),
+                    )
+                    checkpoint = cursor.fetchone()
+                    if checkpoint and checkpoint.get("timestamp"):
+                        return checkpoint
+
                     cursor.execute(
                         """
                         SELECT message_id, message_time_ms AS timestamp

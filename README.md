@@ -198,6 +198,8 @@ python src/pocket48_scraper.py -c config/config.json --stats
 - 如果你希望限制单次执行的翻页深度，可以传 `--max-pages`，例如 `--max-pages 20` 表示最多翻 20 页
 - 如果你要补更早历史，可以显式提高 `--max-pages`
 - 持续抓取模式不会读取命令行里的 `--max-pages`，而是读取配置文件中的 `monitor.max_pages`；这个值越小越省资源，但在高活跃房间里越可能需要多轮才能追平
+- 持续抓取模式下，如果某一轮没有抓到新消息，程序不会每轮都写一条成功记录，而是按 `monitor.success_heartbeat_every` 的配置做心跳采样；默认每空轮询 `10` 轮写一次 `crawl_tasks`
+- 如果你更看重数据库轻量运行，可以把 `monitor.success_heartbeat_every` 调大；如果你更看重抓取审计密度，可以把它调小
 - 这比只抓单页更适合持久化增量抓取，但是否绝对不漏仍取决于服务端分页与接口稳定性
 
 ### 6. 导出已抓取消息
