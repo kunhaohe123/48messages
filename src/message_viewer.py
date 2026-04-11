@@ -433,6 +433,7 @@ def create_app(config_path: str) -> Flask:
             max(request.args.get("page_size", default=50, type=int), 10), 200
         )
         room_id = (request.args.get("room_id") or "").strip() or None
+        member_server_id = request.args.get("member_server_id", type=int)
         sender_keyword = (request.args.get("sender") or "").strip() or None
         keyword = (request.args.get("keyword") or "").strip() or None
         start_time = (request.args.get("start_time") or "").strip()
@@ -442,10 +443,12 @@ def create_app(config_path: str) -> Flask:
         offset = (page - 1) * page_size
 
         rooms = storage.list_rooms()
+        members = storage.list_members()
         summary_stats = build_summary_stats()
 
         search_kwargs = {
             "room_id": room_id,
+            "member_server_id": member_server_id,
             "sender_keyword": sender_keyword,
             "keyword": keyword,
             "msg_type": "TEXT",
@@ -464,6 +467,7 @@ def create_app(config_path: str) -> Flask:
 
         filters = {
             "room_id": room_id or "",
+            "member_server_id": member_server_id or "",
             "sender": sender_keyword or "",
             "keyword": keyword or "",
             "start_time": start_time,
@@ -479,6 +483,17 @@ def create_app(config_path: str) -> Flask:
             label = f"{room.get('name') or room['id']} ({room.get('message_count', 0)})"
             options.append(
                 f'<option value="{html.escape(str(room["id"]))}"{selected}>{html.escape(label)}</option>'
+            )
+
+        member_options = ['<option value="">全部成员</option>']
+        for member in members:
+            member_id = member.get("server_id")
+            selected = (
+                " selected" if str(member_id) == str(member_server_id or "") else ""
+            )
+            label = member.get("owner_name") or member_id
+            member_options.append(
+                f'<option value="{html.escape(str(member_id))}"{selected}>{html.escape(str(label))}</option>'
             )
 
         message_rows = []
@@ -547,8 +562,12 @@ def create_app(config_path: str) -> Flask:
               <select id="room_id" name="room_id">{"".join(options)}</select>
             </div>
             <div>
-              <label for="sender">成员</label>
-              <input id="sender" name="sender" value="{html.escape(filters["sender"])}" placeholder="昵称或姓名">
+              <label for="member_server_id">成员</label>
+              <select id="member_server_id" name="member_server_id">{"".join(member_options)}</select>
+            </div>
+            <div>
+              <label for="sender">名字模糊搜</label>
+              <input id="sender" name="sender" value="{html.escape(filters["sender"])}" placeholder="成员名或发送昵称">
             </div>
             <div>
               <label for="keyword">关键词</label>

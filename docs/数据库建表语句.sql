@@ -58,6 +58,8 @@ CREATE TABLE `messages` (
   `channel_id` BIGINT NOT NULL COMMENT '房间 channel_id',
   `sender_user_id` BIGINT DEFAULT NULL COMMENT '发送者用户ID',
   `sender_name` VARCHAR(255) DEFAULT NULL COMMENT '发送者昵称',
+  `member_name` VARCHAR(255) DEFAULT NULL COMMENT '成员名称快照',
+  `sender_role` VARCHAR(16) NOT NULL DEFAULT 'fan' COMMENT '发送者角色(member/fan)',
   `message_type` VARCHAR(64) NOT NULL COMMENT '消息类型',
   `sub_type` VARCHAR(64) DEFAULT NULL COMMENT '消息子类型',
   `text_content` LONGTEXT DEFAULT NULL COMMENT '文本内容',
@@ -69,11 +71,14 @@ CREATE TABLE `messages` (
   `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
   PRIMARY KEY (`message_id`),
+  KEY `idx_messages_room_time` (`room_id`, `message_time`),
+  KEY `idx_messages_room_role_time` (`room_id`, `sender_role`, `message_time_ms`),
   KEY `idx_messages_server_time` (`server_id`, `message_time_ms`),
+  KEY `idx_messages_server_role_time` (`server_id`, `sender_role`, `message_time_ms`),
   KEY `idx_messages_channel_time` (`channel_id`, `message_time_ms`),
-  KEY `idx_messages_room_time` (`room_id`, `message_time_ms`),
+  KEY `idx_messages_sender_role_time` (`sender_role`, `message_time_ms`),
   KEY `idx_messages_sender_user_id` (`sender_user_id`),
-  KEY `idx_messages_message_time` (`message_time`),
+  KEY `idx_messages_message_time_ms` (`message_time_ms`),
   CONSTRAINT `fk_messages_server_id`
     FOREIGN KEY (`server_id`) REFERENCES `members` (`server_id`)
     ON UPDATE CASCADE

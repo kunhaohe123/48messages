@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 MEMBER_ROLE_ID = 3
 MEMBER_CHANNEL_ROLES: Set[Any] = {2, "2"}
 MEMBER_ROLE_ID_KEYS: Set[str] = {"roleId", "channelRole"}
+MEMBER_SENDER_ROLE = "member"
+FAN_SENDER_ROLE = "fan"
 
 
 def _is_member_role_value(value: Any) -> bool:
@@ -26,13 +28,15 @@ def _is_member_role_value(value: Any) -> bool:
 
 
 def _parse_member_role_from_json(data: Any) -> bool:
-    if not isinstance(data, dict):
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if key in MEMBER_ROLE_ID_KEYS and _is_member_role_value(value):
+                return True
+            if _parse_member_role_from_json(value):
+                return True
         return False
-    user = data.get("user")
-    if isinstance(user, dict) and _is_member_role_value(user.get("roleId")):
-        return True
-    if _is_member_role_value(data.get("channelRole")):
-        return True
+    if isinstance(data, list):
+        return any(_parse_member_role_from_json(item) for item in data)
     return False
 
 
@@ -44,6 +48,63 @@ def _extract_member_sender_user_id(message: Dict[str, Any]) -> Optional[int]:
     if not _parse_member_role_from_json(parsed):
         return None
     return message.get("user_id")
+
+
+def _determine_sender_role(value: Any) -> str:
+    parsed = _parse_json_like(value)
+    if _parse_member_role_from_json(parsed):
+        return MEMBER_SENDER_ROLE
+    if isinstance(value, str) and (
+        '"roleId": 3' in value
+        or '"channelRole": "2"' in value
+        or '"channelRole": 2' in value
+    ):
+        return MEMBER_SENDER_ROLE
+    return FAN_SENDER_ROLE
+
+
+def _determine_sender_role_from_message(message: Dict[str, Any]) -> str:
+    for candidate in (
+        message.get("ext_info"),
+        message.get("content"),
+        {
+            "body": _parse_json_like(message.get("content")),
+            "extInfo": _parse_json_like(message.get("ext_info")),
+        },
+    ):
+        if _determine_sender_role(candidate) == MEMBER_SENDER_ROLE:
+            return MEMBER_SENDER_ROLE
+    return FAN_SENDER_ROLE
+
+
+def _message_server_id(message: Dict[str, Any]) -> Any:
+    return message.get("server_id") or message.get("owner_member_id")
+
+
+def _sqlite_sender_role_case_expression(ext_info_column: str = "ext_info") -> str:
+    return (
+        "CASE "
+        f"WHEN {ext_info_column} LIKE '%\"roleId\": 3%' "
+        f'OR {ext_info_column} LIKE \'%"channelRole": "2"%\' '
+        f"OR {ext_info_column} LIKE '%\"channelRole\": 2%' "
+        f"THEN '{MEMBER_SENDER_ROLE}' ELSE '{FAN_SENDER_ROLE}' END"
+    )
+
+
+def _mysql_sender_role_case_expression(
+    raw_message_column: str = "raw_message_json",
+    ext_info_column: str = "ext_info_json",
+) -> str:
+    return (
+        "CASE "
+        f"WHEN {raw_message_column} LIKE '%\\\"roleId\\\": 3%' "
+        f'OR {raw_message_column} LIKE \'%\\"channelRole\\": \\"2\\"%\' '
+        f"OR {raw_message_column} LIKE '%\\\"channelRole\\\": 2%' "
+        f"OR {ext_info_column} LIKE '%\\\"roleId\\\": 3%' "
+        f'OR {ext_info_column} LIKE \'%\\"channelRole\\": \\"2\\"%\' '
+        f"OR {ext_info_column} LIKE '%\\\"channelRole\\\": 2%' "
+        f"THEN '{MEMBER_SENDER_ROLE}' ELSE '{FAN_SENDER_ROLE}' END"
+    )
 
 
 def _json_dumps(value: Any) -> Optional[str]:
@@ -144,18 +205,6 @@ def _extract_media_fields(body: Any, ext_info: Any) -> Dict[str, Any]:
     }
 
 
-def _determine_sender_role(ext_info_str: str) -> str:
-    if not ext_info_str:
-        return "fan"
-    if (
-        '"roleId": 3' in ext_info_str
-        or '"channelRole": "2"' in ext_info_str
-        or '"channelRole": 2' in ext_info_str
-    ):
-        return "member"
-    return "fan"
-
-
 def _timestamp_ms_to_datetime(value: Any) -> datetime:
     try:
         timestamp_ms = int(value)
@@ -223,9 +272,14 @@ class MessageStorage(ABC):
         pass
 
     @abstractmethod
+    def list_members(self) -> List[Dict[str, Any]]:
+        pass
+
+    @abstractmethod
     def search_messages(
         self,
         room_id: Optional[str] = None,
+        member_server_id: Optional[int] = None,
         sender_keyword: Optional[str] = None,
         keyword: Optional[str] = None,
         msg_type: Optional[str] = None,
@@ -265,6 +319,8 @@ class SQLiteStorage(MessageStorage):
                 message_id TEXT UNIQUE,
                 user_id TEXT,
                 username TEXT,
+                member_name TEXT,
+                sender_role TEXT NOT NULL DEFAULT 'fan',
                 content TEXT,
                 msg_type TEXT,
                 ext_info TEXT,
@@ -286,6 +342,33 @@ class SQLiteStorage(MessageStorage):
             CREATE INDEX IF NOT EXISTS idx_room_id
             ON messages(room_id, timestamp DESC)
         """)
+        cursor.execute("PRAGMA table_info(messages)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "member_name" not in columns:
+            cursor.execute("ALTER TABLE messages ADD COLUMN member_name TEXT")
+        if "sender_role" not in columns:
+            cursor.execute(
+                "ALTER TABLE messages ADD COLUMN sender_role TEXT NOT NULL DEFAULT 'fan'"
+            )
+            cursor.execute(
+                f"UPDATE messages SET sender_role = {_sqlite_sender_role_case_expression()}"
+            )
+        else:
+            cursor.execute(
+                f"UPDATE messages SET sender_role = {_sqlite_sender_role_case_expression()} WHERE sender_role IS NULL OR sender_role = ''"
+            )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_messages_role_time
+            ON messages(sender_role, timestamp DESC)
+        """
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_messages_room_role_time
+            ON messages(room_id, sender_role, timestamp DESC)
+        """
+        )
         conn.commit()
         conn.close()
 
@@ -296,14 +379,16 @@ class SQLiteStorage(MessageStorage):
             cursor.execute(
                 """
                 INSERT OR IGNORE INTO messages
-                (room_id, message_id, user_id, username, content, msg_type, ext_info, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (room_id, message_id, user_id, username, member_name, sender_role, content, msg_type, ext_info, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                     message.get("room_id"),
                     message.get("message_id"),
                     message.get("user_id"),
                     message.get("username"),
+                    message.get("member_name"),
+                    _determine_sender_role_from_message(message),
                     _json_dumps(message.get("content")),
                     str(message.get("msg_type") or ""),
                     _json_dumps(message.get("ext_info")),
@@ -338,8 +423,8 @@ class SQLiteStorage(MessageStorage):
             cursor.executemany(
                 """
                 INSERT OR IGNORE INTO messages
-                (room_id, message_id, user_id, username, content, msg_type, ext_info, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (room_id, message_id, user_id, username, member_name, sender_role, content, msg_type, ext_info, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 [
                     (
@@ -347,6 +432,8 @@ class SQLiteStorage(MessageStorage):
                         message.get("message_id"),
                         message.get("user_id"),
                         message.get("username"),
+                        message.get("member_name"),
+                        _determine_sender_role_from_message(message),
                         _json_dumps(message.get("content")),
                         str(message.get("msg_type") or ""),
                         _json_dumps(message.get("ext_info")),
@@ -373,7 +460,7 @@ class SQLiteStorage(MessageStorage):
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT room_id, message_id, user_id, username, content, msg_type, ext_info, timestamp, created_at
+            SELECT room_id, message_id, user_id, username, member_name, sender_role, content, msg_type, ext_info, timestamp, created_at
             FROM messages WHERE room_id = ? ORDER BY timestamp DESC LIMIT ?
         """,
             (room_id, limit),
@@ -386,11 +473,13 @@ class SQLiteStorage(MessageStorage):
                 "message_id": row[1],
                 "user_id": row[2],
                 "username": row[3],
-                "content": row[4],
-                "msg_type": row[5],
-                "ext_info": row[6],
-                "timestamp": row[7],
-                "created_at": row[8],
+                "member_name": row[4],
+                "sender_role": row[5],
+                "content": row[6],
+                "msg_type": row[7],
+                "ext_info": row[8],
+                "timestamp": row[9],
+                "created_at": row[10],
             }
             for row in rows
         ]
@@ -408,7 +497,7 @@ class SQLiteStorage(MessageStorage):
     ) -> int:
         conn = self._connect()
         cursor = conn.cursor()
-        query = "SELECT room_id, message_id, user_id, username, content, msg_type, ext_info, timestamp, created_at FROM messages"
+        query = "SELECT room_id, message_id, user_id, username, member_name, sender_role, content, msg_type, ext_info, timestamp, created_at FROM messages"
         params: List[Any] = []
         if room_id:
             query += " WHERE room_id = ?"
@@ -425,11 +514,13 @@ class SQLiteStorage(MessageStorage):
                 "message_id": row[1],
                 "user_id": row[2],
                 "username": row[3],
-                "content": row[4],
-                "msg_type": row[5],
-                "ext_info": row[6],
-                "timestamp": row[7],
-                "created_at": row[8],
+                "member_name": row[4],
+                "sender_role": row[5],
+                "content": row[6],
+                "msg_type": row[7],
+                "ext_info": row[8],
+                "timestamp": row[9],
+                "created_at": row[10],
             }
             for row in rows
         ]
@@ -448,6 +539,8 @@ class SQLiteStorage(MessageStorage):
                         "message_id",
                         "user_id",
                         "username",
+                        "member_name",
+                        "sender_role",
                         "content",
                         "msg_type",
                         "ext_info",
@@ -554,6 +647,7 @@ class SQLiteStorage(MessageStorage):
     def search_messages(
         self,
         room_id: Optional[str] = None,
+        member_server_id: Optional[int] = None,
         sender_keyword: Optional[str] = None,
         keyword: Optional[str] = None,
         msg_type: Optional[str] = None,
@@ -571,6 +665,9 @@ class SQLiteStorage(MessageStorage):
         if room_id:
             where_clauses.append("room_id = ?")
             params.append(room_id)
+        if member_server_id is not None:
+            where_clauses.append("user_id = ?")
+            params.append(str(member_server_id))
         if sender_keyword:
             where_clauses.append("(username LIKE ? OR user_id LIKE ?)")
             like_value = f"%{sender_keyword}%"
@@ -588,14 +685,9 @@ class SQLiteStorage(MessageStorage):
         if end_time_ms is not None:
             where_clauses.append("timestamp <= ?")
             params.append(end_time_ms)
-        if sender_role == "member":
-            where_clauses.append(
-                '(ext_info LIKE \'%"roleId": 3%\' OR ext_info LIKE \'%"channelRole": "2"%\' OR ext_info LIKE \'%"channelRole": 2%\')'
-            )
-        elif sender_role == "fan":
-            where_clauses.append(
-                'NOT (ext_info LIKE \'%"roleId": 3%\' OR ext_info LIKE \'%"channelRole": "2"%\' OR ext_info LIKE \'%"channelRole": 2%\')'
-            )
+        if sender_role in {MEMBER_SENDER_ROLE, FAN_SENDER_ROLE}:
+            where_clauses.append("sender_role = ?")
+            params.append(sender_role)
 
         where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
         cursor.execute(f"SELECT COUNT(*) FROM messages{where_sql}", params)
@@ -604,7 +696,7 @@ class SQLiteStorage(MessageStorage):
         data_params = params + [limit, offset]
         cursor.execute(
             f"""
-            SELECT room_id, message_id, user_id, username, content, msg_type, ext_info, timestamp, created_at
+            SELECT room_id, message_id, user_id, username, member_name, sender_role, content, msg_type, ext_info, timestamp, created_at
             FROM messages
             {where_sql}
             ORDER BY timestamp DESC
@@ -620,12 +712,13 @@ class SQLiteStorage(MessageStorage):
                 "message_id": row[1],
                 "user_id": row[2],
                 "username": row[3],
-                "sender_role": _determine_sender_role(str(row[6])),
-                "content": row[4],
-                "msg_type": row[5],
-                "ext_info": row[6],
-                "timestamp": row[7],
-                "created_at": row[8],
+                "member_name": row[4],
+                "sender_role": row[5],
+                "content": row[6],
+                "msg_type": row[7],
+                "ext_info": row[8],
+                "timestamp": row[9],
+                "created_at": row[10],
             }
             for row in rows
         ]
@@ -636,7 +729,7 @@ class SQLiteStorage(MessageStorage):
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT room_id, message_id, user_id, username, content, msg_type, ext_info, timestamp, created_at
+            SELECT room_id, message_id, user_id, username, member_name, sender_role, content, msg_type, ext_info, timestamp, created_at
             FROM messages
             WHERE message_id = ?
             LIMIT 1
@@ -652,13 +745,40 @@ class SQLiteStorage(MessageStorage):
             "message_id": row[1],
             "user_id": row[2],
             "username": row[3],
-            "sender_role": _determine_sender_role(str(row[6])),
-            "content": row[4],
-            "msg_type": row[5],
-            "ext_info": row[6],
-            "timestamp": row[7],
-            "created_at": row[8],
+            "member_name": row[4],
+            "sender_role": row[5],
+            "content": row[6],
+            "msg_type": row[7],
+            "ext_info": row[8],
+            "timestamp": row[9],
+            "created_at": row[10],
         }
+
+    def list_members(self) -> List[Dict[str, Any]]:
+        conn = self._connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT user_id AS server_id, COALESCE(NULLIF(member_name, ''), NULLIF(username, ''), user_id) AS owner_name,
+                   COUNT(*) AS message_count, MAX(timestamp) AS latest_timestamp
+            FROM messages
+            WHERE sender_role = ?
+            GROUP BY user_id, member_name, username
+            ORDER BY owner_name ASC
+            """,
+            (MEMBER_SENDER_ROLE,),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return [
+            {
+                "server_id": row[0],
+                "owner_name": row[1],
+                "message_count": row[2],
+                "latest_timestamp": row[3],
+            }
+            for row in rows
+        ]
 
     def get_top_member_for_day(self, start_time_ms: int) -> Optional[Dict[str, Any]]:
         conn = self._connect()
@@ -671,12 +791,12 @@ class SQLiteStorage(MessageStorage):
             FROM messages
             WHERE msg_type = ?
               AND timestamp >= ?
-              AND (ext_info LIKE '%"roleId": 3%' OR ext_info LIKE '%"channelRole": "2"%' OR ext_info LIKE '%"channelRole": 2%')
+              AND sender_role = ?
             GROUP BY COALESCE(NULLIF(username, ''), CAST(user_id AS TEXT), '-')
             ORDER BY message_count DESC, MAX(timestamp) DESC
             LIMIT 1
             """,
-            ("TEXT", start_time_ms),
+            ("TEXT", start_time_ms, MEMBER_SENDER_ROLE),
         )
         row = cursor.fetchone()
         conn.close()
@@ -856,6 +976,8 @@ class MySQLStorage(MessageStorage):
                         channel_id BIGINT NOT NULL COMMENT '房间 channel_id',
                         sender_user_id BIGINT NULL COMMENT '发送者用户ID',
                         sender_name VARCHAR(255) NULL COMMENT '发送者昵称',
+                        member_name VARCHAR(255) NULL COMMENT '成员名称快照',
+                        sender_role VARCHAR(16) NOT NULL DEFAULT 'fan' COMMENT '发送者角色(member/fan)',
                         message_type VARCHAR(64) NOT NULL COMMENT '消息类型',
                         sub_type VARCHAR(64) NULL COMMENT '消息子类型',
                         text_content LONGTEXT NULL COMMENT '文本内容',
@@ -867,8 +989,11 @@ class MySQLStorage(MessageStorage):
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
                         KEY idx_messages_room_time (room_id, message_time),
+                        KEY idx_messages_room_role_time (room_id, sender_role, message_time_ms),
                         KEY idx_messages_server_time (server_id, message_time_ms),
+                        KEY idx_messages_server_role_time (server_id, sender_role, message_time_ms),
                         KEY idx_messages_channel_time (channel_id, message_time_ms),
+                        KEY idx_messages_sender_role_time (sender_role, message_time_ms),
                         KEY idx_messages_sender_user_id (sender_user_id),
                         KEY idx_messages_message_time_ms (message_time_ms),
                         CONSTRAINT fk_messages_server_id
@@ -935,12 +1060,56 @@ class MySQLStorage(MessageStorage):
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='抓取断点表'
                     """
                 )
+                self._ensure_messages_sender_role_schema(cursor)
             conn.commit()
         except Exception:
             conn.rollback()
             raise
         finally:
             conn.close()
+
+    def _mysql_index_exists(self, cursor, table_name: str, index_name: str) -> bool:
+        cursor.execute(
+            f"SHOW INDEX FROM `{table_name}` WHERE Key_name = %s", (index_name,)
+        )
+        return cursor.fetchone() is not None
+
+    def _ensure_messages_sender_role_schema(self, cursor) -> None:
+        cursor.execute("SHOW COLUMNS FROM messages LIKE 'member_name'")
+        has_member_name = cursor.fetchone() is not None
+        if not has_member_name:
+            cursor.execute(
+                "ALTER TABLE messages ADD COLUMN member_name VARCHAR(255) NULL COMMENT '成员名称快照' AFTER sender_name"
+            )
+
+        cursor.execute("SHOW COLUMNS FROM messages LIKE 'sender_role'")
+        has_sender_role = cursor.fetchone() is not None
+        if not has_sender_role:
+            cursor.execute(
+                "ALTER TABLE messages ADD COLUMN sender_role VARCHAR(16) NOT NULL DEFAULT 'fan' COMMENT '发送者角色(member/fan)' AFTER member_name"
+            )
+        cursor.execute(
+            f"UPDATE messages SET sender_role = {_mysql_sender_role_case_expression()} WHERE sender_role IS NULL OR sender_role = ''"
+        )
+        cursor.execute(
+            """
+            UPDATE messages m
+            LEFT JOIN members mem ON mem.server_id = m.server_id
+            SET m.member_name = mem.owner_name
+            WHERE (m.member_name IS NULL OR m.member_name = '')
+              AND mem.owner_name IS NOT NULL
+              AND mem.owner_name <> ''
+            """
+        )
+
+        index_definitions = {
+            "idx_messages_room_role_time": "CREATE INDEX idx_messages_room_role_time ON messages (room_id, sender_role, message_time_ms)",
+            "idx_messages_server_role_time": "CREATE INDEX idx_messages_server_role_time ON messages (server_id, sender_role, message_time_ms)",
+            "idx_messages_sender_role_time": "CREATE INDEX idx_messages_sender_role_time ON messages (sender_role, message_time_ms)",
+        }
+        for index_name, statement in index_definitions.items():
+            if not self._mysql_index_exists(cursor, "messages", index_name):
+                cursor.execute(statement)
 
     def _normalize_member_record(self, member: Dict[str, Any]) -> Dict[str, Any]:
         return {
@@ -990,6 +1159,27 @@ class MySQLStorage(MessageStorage):
             "ctime": member.get("ctime"),
             "utime": member.get("utime"),
             "is_in_group": member.get("isInGroup"),
+        }
+
+    def _get_member_name_map(self, cursor, server_ids: List[Any]) -> Dict[Any, str]:
+        normalized_ids = []
+        for server_id in server_ids:
+            if server_id in (None, ""):
+                continue
+            if server_id not in normalized_ids:
+                normalized_ids.append(server_id)
+        if not normalized_ids:
+            return {}
+
+        placeholders = ", ".join(["%s"] * len(normalized_ids))
+        cursor.execute(
+            f"SELECT server_id, owner_name FROM members WHERE server_id IN ({placeholders})",
+            normalized_ids,
+        )
+        return {
+            row["server_id"]: row["owner_name"]
+            for row in cursor.fetchall()
+            if row.get("owner_name")
         }
 
     def sync_members(self, members: List[Dict[str, Any]]) -> int:
@@ -1076,6 +1266,18 @@ class MySQLStorage(MessageStorage):
                         """,
                         rows,
                     )
+                    server_ids = [row["server_id"] for row in rows]
+                    if server_ids:
+                        placeholders = ", ".join(["%s"] * len(server_ids))
+                        cursor.execute(
+                            f"""
+                            UPDATE messages m
+                            JOIN members mem ON mem.server_id = m.server_id
+                            SET m.member_name = mem.owner_name
+                            WHERE m.server_id IN ({placeholders})
+                            """,
+                            server_ids,
+                        )
                 conn.commit()
                 return len(rows)
             except Exception:
@@ -1092,7 +1294,7 @@ class MySQLStorage(MessageStorage):
 
     def save_message(self, message: Dict[str, Any]) -> bool:
         room_id = message.get("room_id")
-        server_id = message.get("server_id") or message.get("owner_member_id")
+        server_id = _message_server_id(message)
         channel_id = message.get("channel_id")
         if server_id is None or channel_id is None:
             raise ValueError("消息缺少 server_id 或 channel_id，无法写入 MySQL")
@@ -1102,13 +1304,16 @@ class MySQLStorage(MessageStorage):
                 with conn.cursor() as cursor:
                     message_id = str(message.get("message_id") or "")
                     raw_message_json = self._serialize_raw_message(message)
+                    member_name = self._get_member_name_map(cursor, [server_id]).get(
+                        server_id
+                    )
                     inserted = cursor.execute(
                         """
                         INSERT IGNORE INTO messages (
                             message_id, room_id, server_id, channel_id, sender_user_id, sender_name,
-                            message_type, sub_type, text_content, ext_info_json, raw_message_json,
+                            member_name, sender_role, message_type, sub_type, text_content, ext_info_json, raw_message_json,
                             message_time, message_time_ms, is_deleted
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                         (
                             message_id,
@@ -1117,6 +1322,8 @@ class MySQLStorage(MessageStorage):
                             channel_id,
                             message.get("user_id"),
                             message.get("username"),
+                            member_name,
+                            _determine_sender_role_from_message(message),
                             str(message.get("msg_type") or "UNKNOWN"),
                             message.get("sub_type"),
                             _extract_text_content(
@@ -1181,9 +1388,7 @@ class MySQLStorage(MessageStorage):
             return 0
 
         first_message = messages[0]
-        server_id = first_message.get("server_id") or first_message.get(
-            "owner_member_id"
-        )
+        server_id = _message_server_id(first_message)
         channel_id = first_message.get("channel_id")
         if server_id is None or channel_id is None:
             raise ValueError("消息缺少 server_id 或 channel_id，无法写入 MySQL")
@@ -1204,6 +1409,10 @@ class MySQLStorage(MessageStorage):
                         existing_message_ids = {
                             str(row["message_id"] or "") for row in cursor.fetchall()
                         }
+                    member_name_map = self._get_member_name_map(
+                        cursor,
+                        [_message_server_id(message) for message in messages],
+                    )
                     message_rows = []
                     payload_rows = []
                     pending_payload_message_ids: set[str] = set()
@@ -1219,6 +1428,8 @@ class MySQLStorage(MessageStorage):
                                 message.get("channel_id"),
                                 message.get("user_id"),
                                 message.get("username"),
+                                member_name_map.get(_message_server_id(message)),
+                                _determine_sender_role_from_message(message),
                                 str(message.get("msg_type") or "UNKNOWN"),
                                 message.get("sub_type"),
                                 _extract_text_content(
@@ -1261,9 +1472,9 @@ class MySQLStorage(MessageStorage):
                         """
                         INSERT IGNORE INTO messages (
                             message_id, room_id, server_id, channel_id, sender_user_id, sender_name,
-                            message_type, sub_type, text_content, ext_info_json, raw_message_json,
+                            member_name, sender_role, message_type, sub_type, text_content, ext_info_json, raw_message_json,
                             message_time, message_time_ms, is_deleted
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                         message_rows,
                     )
@@ -1309,6 +1520,8 @@ class MySQLStorage(MessageStorage):
                             m.message_id,
                             m.sender_user_id AS user_id,
                             m.sender_name AS username,
+                            m.member_name,
+                            m.sender_role,
                             m.text_content AS content,
                             m.message_type AS msg_type,
                             COALESCE(m.ext_info_json, mp.ext_json) AS ext_info,
@@ -1362,6 +1575,8 @@ class MySQLStorage(MessageStorage):
                             m.message_id,
                             m.sender_user_id AS user_id,
                             m.sender_name AS username,
+                            m.member_name,
+                            m.sender_role,
                             m.text_content AS content,
                             m.message_type AS msg_type,
                             COALESCE(m.ext_info_json, mp.ext_json) AS ext_info,
@@ -1397,6 +1612,8 @@ class MySQLStorage(MessageStorage):
                     "message_id",
                     "user_id",
                     "username",
+                    "member_name",
+                    "sender_role",
                     "content",
                     "msg_type",
                     "ext_info",
@@ -1559,6 +1776,7 @@ class MySQLStorage(MessageStorage):
     def search_messages(
         self,
         room_id: Optional[str] = None,
+        member_server_id: Optional[int] = None,
         sender_keyword: Optional[str] = None,
         keyword: Optional[str] = None,
         msg_type: Optional[str] = None,
@@ -1577,12 +1795,15 @@ class MySQLStorage(MessageStorage):
                     if room_id:
                         where_clauses.append("m.room_id = %s")
                         params.append(room_id)
+                    if member_server_id is not None:
+                        where_clauses.append("m.server_id = %s")
+                        params.append(member_server_id)
                     if sender_keyword:
                         where_clauses.append(
-                            "(m.sender_name LIKE %s OR mem.owner_name LIKE %s)"
+                            "(m.sender_name LIKE %s OR m.member_name LIKE %s OR mem.owner_name LIKE %s)"
                         )
                         like_value = f"%{sender_keyword}%"
-                        params.extend([like_value, like_value])
+                        params.extend([like_value, like_value, like_value])
                     if keyword:
                         where_clauses.append(
                             "("
@@ -1615,33 +1836,11 @@ class MySQLStorage(MessageStorage):
                         where_clauses.append("m.message_time_ms <= %s")
                         params.append(end_time_ms)
                     if sender_role == "member":
-                        where_clauses.append(
-                            "(m.raw_message_json LIKE %s OR m.raw_message_json LIKE %s OR m.raw_message_json LIKE %s OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s)"
-                        )
-                        params.extend(
-                            [
-                                '%"roleId": 3%',
-                                '%"channelRole": "2"%',
-                                '%"channelRole": 2%',
-                                '%"roleId": 3%',
-                                '%"channelRole": "2"%',
-                                '%"channelRole": 2%',
-                            ]
-                        )
+                        where_clauses.append("m.sender_role = %s")
+                        params.append(MEMBER_SENDER_ROLE)
                     elif sender_role == "fan":
-                        where_clauses.append(
-                            "NOT (m.raw_message_json LIKE %s OR m.raw_message_json LIKE %s OR m.raw_message_json LIKE %s OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s)"
-                        )
-                        params.extend(
-                            [
-                                '%"roleId": 3%',
-                                '%"channelRole": "2"%',
-                                '%"channelRole": 2%',
-                                '%"roleId": 3%',
-                                '%"channelRole": "2"%',
-                                '%"channelRole": 2%',
-                            ]
-                        )
+                        where_clauses.append("m.sender_role = %s")
+                        params.append(FAN_SENDER_ROLE)
 
                     where_sql = (
                         f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
@@ -1663,16 +1862,8 @@ class MySQLStorage(MessageStorage):
                             m.message_id,
                             m.sender_user_id AS user_id,
                             m.sender_name AS username,
-                            CASE
-                                WHEN m.raw_message_json LIKE '%%\"roleId\": 3%%'
-                                     OR m.raw_message_json LIKE '%%\"channelRole\": \"2\"%%'
-                                     OR m.raw_message_json LIKE '%%\"channelRole\": 2%%'
-                                     OR mp.ext_json LIKE '%%\"roleId\": 3%%'
-                                     OR mp.ext_json LIKE '%%\"channelRole\": \"2\"%%'
-                                     OR mp.ext_json LIKE '%%\"channelRole\": 2%%'
-                                THEN 'member'
-                                ELSE 'fan'
-                            END AS sender_role,
+                            COALESCE(m.member_name, mem.owner_name) AS member_name,
+                            m.sender_role,
                             m.text_content AS content,
                             m.message_type AS msg_type,
                             COALESCE(m.ext_info_json, mp.ext_json) AS ext_info,
@@ -1683,7 +1874,7 @@ class MySQLStorage(MessageStorage):
                             mp.reply_to_text,
                             mp.flip_question,
                             mp.flip_answer,
-                            mem.owner_name AS member_name
+                            COALESCE(m.member_name, mem.owner_name) AS room_member_name
                         FROM messages m
                         LEFT JOIN message_payloads mp ON mp.message_id = m.message_id
                         LEFT JOIN members mem ON mem.server_id = m.server_id
@@ -1711,16 +1902,8 @@ class MySQLStorage(MessageStorage):
                             m.sender_user_id AS user_id,
                             m.sender_name AS username,
                             m.server_id,
-                            CASE
-                                WHEN m.raw_message_json LIKE '%%\"roleId\": 3%%'
-                                     OR m.raw_message_json LIKE '%%\"channelRole\": \"2\"%%'
-                                     OR m.raw_message_json LIKE '%%\"channelRole\": 2%%'
-                                     OR mp.ext_json LIKE '%%\"roleId\": 3%%'
-                                     OR mp.ext_json LIKE '%%\"channelRole\": \"2\"%%'
-                                     OR mp.ext_json LIKE '%%\"channelRole\": 2%%'
-                                THEN 'member'
-                                ELSE 'fan'
-                            END AS sender_role,
+                            COALESCE(m.member_name, mem.owner_name) AS member_name,
+                            m.sender_role,
                             m.message_type AS msg_type,
                             m.sub_type,
                             m.text_content AS content,
@@ -1753,6 +1936,26 @@ class MySQLStorage(MessageStorage):
                 )
                 raise
 
+    def list_members(self) -> List[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT
+                            server_id,
+                            owner_name,
+                            room_id,
+                            channel_id
+                        FROM members
+                        ORDER BY owner_name ASC, server_id ASC
+                        """
+                    )
+                    return list(cursor.fetchall())
+            except Exception:
+                logger.error("获取成员列表失败: %s", exc_info=True)
+                raise
+
     def get_top_member_for_day(self, start_time_ms: int) -> Optional[Dict[str, Any]]:
         with self._get_conn() as conn:
             try:
@@ -1760,30 +1963,22 @@ class MySQLStorage(MessageStorage):
                     cursor.execute(
                         """
                         SELECT
-                            COALESCE(NULLIF(mem.owner_name, ''), NULLIF(m.sender_name, ''), CAST(m.sender_user_id AS CHAR), '-') AS member_name,
+                            COALESCE(NULLIF(m.member_name, ''), NULLIF(mem.owner_name, ''), NULLIF(m.sender_name, ''), CAST(m.sender_user_id AS CHAR), '-') AS member_name,
                             COUNT(*) AS message_count
                         FROM messages m
                         LEFT JOIN message_payloads mp ON mp.message_id = m.message_id
                         LEFT JOIN members mem ON mem.server_id = m.server_id
                         WHERE m.message_type = %s
                           AND m.message_time_ms >= %s
-                          AND (
-                            m.raw_message_json LIKE %s OR m.raw_message_json LIKE %s OR m.raw_message_json LIKE %s
-                            OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s OR mp.ext_json LIKE %s
-                          )
-                        GROUP BY COALESCE(NULLIF(mem.owner_name, ''), NULLIF(m.sender_name, ''), CAST(m.sender_user_id AS CHAR), '-')
+                          AND m.sender_role = %s
+                        GROUP BY COALESCE(NULLIF(m.member_name, ''), NULLIF(mem.owner_name, ''), NULLIF(m.sender_name, ''), CAST(m.sender_user_id AS CHAR), '-')
                         ORDER BY message_count DESC, MAX(m.message_time_ms) DESC
                         LIMIT 1
                         """,
                         (
                             "TEXT",
                             start_time_ms,
-                            '%"roleId": 3%',
-                            '%"channelRole": "2"%',
-                            '%"channelRole": 2%',
-                            '%"roleId": 3%',
-                            '%"channelRole": "2"%',
-                            '%"channelRole": 2%',
+                            MEMBER_SENDER_ROLE,
                         ),
                     )
                     row = cursor.fetchone()
