@@ -198,9 +198,11 @@ python src/pocket48_scraper.py -c config/config.json --stats
 - `--since-days` 会把历史覆盖进度记录到 `crawl_history_checkpoints`；下次补更长历史时，会先检查本地是否已经覆盖到目标时间
 - 历史补抓默认每 5 页更新一次历史断点；如果存在未验证的 `nextTime` 游标，程序会先做一次探测校验，校验通过后自动把该房间提升为 `cursor_verified=1`，后续再直接用于续翻
 - 单次抓取默认使用自适应翻页间隔：前 `20` 页 `0s`、第 `21-100` 页 `0.1s`、`100` 页之后 `0.3s`；如果你显式传了 `--page-delay`，则以命令行为准
+- 单页接口请求失败时，不会再被当成“空页”直接吞掉；程序会按 `api.retry_times` / `api.retry_delay` 做有限重试，重试仍失败才把该轮记为失败
 - 如果你希望限制单次执行的翻页深度，可以传 `--max-pages`，例如 `--max-pages 20` 表示最多翻 20 页；如果在达到目标时间之前提前触发这个保护值，历史断点会记录为未完成状态
 - 如果你要补更早历史，可以显式提高 `--max-pages`
 - 持续抓取模式不会读取命令行里的 `--max-pages`，而是读取配置文件中的 `monitor.max_pages`；这个值越小越省资源，但在高活跃房间里越可能需要多轮才能追平
+- 持续抓取模式现在使用有限 worker 调度，而不是一房间一个永久线程；可用 `monitor.workers` 控制并发上限，`monitor.jitter_seconds` 打散同一时刻的请求峰值
 - 持续抓取模式下，如果某一轮没有抓到新消息，程序不会每轮都写一条成功记录，而是按 `monitor.success_heartbeat_every` 的配置做心跳采样；默认每空轮询 `10` 轮写一次 `crawl_tasks`
 - 如果你更看重数据库轻量运行，可以把 `monitor.success_heartbeat_every` 调大；如果你更看重抓取审计密度，可以把它调小
 - 这比只抓单页更适合持久化增量抓取，但是否绝对不漏仍取决于服务端分页与接口稳定性

@@ -10,6 +10,7 @@ import time
 import logging
 import logging.handlers
 import threading
+import random
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -220,6 +221,10 @@ class AuthenticationUnavailableError(RuntimeError):
     """当前没有可用认证信息，但服务应继续等待人工恢复。"""
 
 
+class FetchMessagesError(RuntimeError):
+    """房间消息接口请求失败。"""
+
+
 class TokenManager:
     """负责本地缓存 token，并维护本地过期时间。"""
 
@@ -275,7 +280,14 @@ class TokenManager:
     ) -> bool:
         if not self.has_token():
             return False
-        new_expires_at = time.time() + expires_in
+        now = time.time()
+        old_expires_at = self.token_data.get("expires_at", 0)
+        remaining_seconds = max(old_expires_at - now, 0)
+        refresh_when_below = max(int(expires_in // 3), 600)
+        if remaining_seconds > refresh_when_below:
+            return False
+
+        new_expires_at = now + expires_in
         old_expires_at = self.token_data.get("expires_at", 0)
         if new_expires_at <= old_expires_at:
             return False
@@ -382,6 +394,20 @@ class Pocket48Client:
         except (TypeError, ValueError):
             return 10
 
+    def _api_retry_times(self) -> int:
+        configured = self._api_config().get("retry_times", 3)
+        try:
+            return max(int(configured), 1)
+        except (TypeError, ValueError):
+            return 3
+
+    def _api_retry_delay_seconds(self) -> float:
+        configured = self._api_config().get("retry_delay", 5)
+        try:
+            return max(float(configured), 0.0)
+        except (TypeError, ValueError):
+            return 5.0
+
     def reload_auth_state(self):
         self.config = load_config(str(resolve_project_path(self.config_path)))
         self.notifier = ServerChanNotifier(self.config.get("notify", {}))
@@ -474,7 +500,7 @@ class Pocket48Client:
 
     def login(self) -> bool:
         if self.token_manager.get_token():
-            logger.info("Using saved token")
+            logger.debug("Using saved token")
             return True
 
         stale_token = self.token_manager.get_token(allow_expired=True)
@@ -567,15 +593,9 @@ class Pocket48Client:
         server_id = member.get("serverId")
         channel_id = member.get("channelId")
         if server_id is None or channel_id is None:
-            logger.error(
-                "成员配置缺少 serverId 或 channelId: %s", _member_display_name(member)
+            raise ValueError(
+                f"成员配置缺少 serverId 或 channelId: {_member_display_name(member)}"
             )
-            return {
-                "messages": [],
-                "next_time": next_time,
-                "raw_count": 0,
-                "oldest_raw_timestamp": None,
-            }
 
         payload = {
             "limit": limit,
@@ -585,7 +605,7 @@ class Pocket48Client:
         }
 
         try:
-            logger.info(
+            logger.debug(
                 "Fetching room messages: %s(%s)",
                 _member_display_name(member),
                 channel_id,
@@ -614,13 +634,11 @@ class Pocket48Client:
                     self._block_password_login(
                         f"saved token rejected by server: {message}"
                     )
-                logger.error("Fetch failed: %s", data.get("message"))
-                return {
-                    "messages": [],
-                    "next_time": next_time,
-                    "raw_count": 0,
-                    "oldest_raw_timestamp": None,
-                }
+                    raise AuthenticationUnavailableError(
+                        self.password_login_blocked_reason
+                        or f"saved token rejected by server: {message}"
+                    )
+                raise FetchMessagesError(f"Fetch failed: {message}")
 
             content = data.get("content", {})
             messages = content.get("message", [])
@@ -667,7 +685,7 @@ class Pocket48Client:
                 )
 
             self._mark_token_accepted()
-            logger.info("Fetched %s member TEXT messages", len(normalized_messages))
+            logger.debug("Fetched %s member TEXT messages", len(normalized_messages))
             return {
                 "messages": normalized_messages,
                 "next_time": content.get("nextTime", next_time),
@@ -690,21 +708,58 @@ class Pocket48Client:
                 self._block_password_login(
                     f"saved token rejected by server with HTTP {exc.response.status_code}"
                 )
-            logger.error("Fetch message error: %s", exc)
-            return {
-                "messages": [],
-                "next_time": next_time,
-                "raw_count": 0,
-                "oldest_raw_timestamp": None,
-            }
+                raise AuthenticationUnavailableError(
+                    self.password_login_blocked_reason
+                    or f"saved token rejected by server with HTTP {exc.response.status_code}"
+                ) from exc
+            raise FetchMessagesError(f"Fetch message HTTP error: {exc}") from exc
+        except requests.RequestException as exc:
+            raise FetchMessagesError(f"Fetch message request error: {exc}") from exc
         except Exception as exc:
-            logger.error("Fetch message error: %s", exc)
-            return {
-                "messages": [],
-                "next_time": next_time,
-                "raw_count": 0,
-                "oldest_raw_timestamp": None,
-            }
+            raise FetchMessagesError(f"Fetch message error: {exc}") from exc
+
+    def _retry_sleep_seconds(self, retry_delay: float, attempt_index: int) -> float:
+        if retry_delay <= 0:
+            return 0.0
+        return retry_delay * attempt_index
+
+    def _get_room_messages_with_retry(
+        self, member: Dict[str, Any], limit: int, next_time: int
+    ) -> tuple[Dict[str, Any], int]:
+        max_attempts = self._api_retry_times()
+        retry_delay = self._api_retry_delay_seconds()
+        room_name = _member_display_name(member)
+        room_id = member.get("channelId")
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return self.get_room_messages(
+                    member, limit=limit, next_time=next_time
+                ), (attempt - 1)
+            except AuthenticationUnavailableError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                if attempt >= max_attempts:
+                    break
+                sleep_seconds = self._retry_sleep_seconds(retry_delay, attempt)
+                logger.warning(
+                    "Fetch retry %s(%s) page nextTime=%s attempt %s/%s failed: %s",
+                    room_name,
+                    room_id,
+                    next_time,
+                    attempt,
+                    max_attempts,
+                    exc,
+                )
+                if sleep_seconds > 0:
+                    time.sleep(sleep_seconds)
+
+        assert last_error is not None
+        raise FetchMessagesError(
+            f"failed after {max_attempts} attempts: {last_error}"
+        ) from last_error
 
     def save_messages(self, messages: List[Dict[str, Any]]) -> int:
         return self.storage.save_messages(messages)
@@ -906,7 +961,10 @@ class Pocket48Client:
                     max_pages,
                 )
                 break
-            result = self.get_room_messages(member, limit=limit, next_time=next_time)
+            result, retry_count = self._get_room_messages_with_retry(
+                member, limit=limit, next_time=next_time
+            )
+            consecutive_errors = retry_count
             page_messages = result["messages"]
             raw_count = result.get("raw_count", 0)
             newest_raw_timestamp = result.get("newest_raw_timestamp")
@@ -955,7 +1013,7 @@ class Pocket48Client:
                 if oldest_raw_timestamp
                 else "N/A"
             )
-            logger.info(
+            logger.debug(
                 "[Page %s] [collected %s] [elapsed %.0fs] [oldest %s]",
                 page_count,
                 len(collected_messages),
@@ -963,22 +1021,22 @@ class Pocket48Client:
                 oldest_str,
             )
             if should_stop:
-                logger.info("[%s] Stop: local latest boundary reached", room_name)
+                logger.debug("[%s] Stop: local latest boundary reached", room_name)
                 break
             if (
                 since_time_ms is not None
                 and oldest_raw_timestamp is not None
                 and oldest_raw_timestamp <= since_time_ms
             ):
-                logger.info(
+                logger.debug(
                     "[%s] Stop: reached initial 30-day protection boundary", room_name
                 )
                 break
             if not new_next_time:
-                logger.info("[%s] Stop: no more messages", room_name)
+                logger.debug("[%s] Stop: no more messages", room_name)
                 break
             if new_next_time == next_time:
-                logger.info("[%s] Stop: pagination ended", room_name)
+                logger.debug("[%s] Stop: pagination ended", room_name)
                 break
             next_time = new_next_time
             effective_page_delay = self._get_adaptive_page_delay(
@@ -987,7 +1045,7 @@ class Pocket48Client:
                 consecutive_errors=consecutive_errors,
             )
             if last_logged_delay != effective_page_delay:
-                logger.info(
+                logger.debug(
                     "[%s] Page delay -> %ss",
                     room_name,
                     _format_delay(effective_page_delay),
@@ -1102,9 +1160,10 @@ class Pocket48Client:
                 break
 
             requested_next_time = next_time
-            result = self.get_room_messages(
+            result, retry_count = self._get_room_messages_with_retry(
                 member, limit=limit, next_time=requested_next_time
             )
+            consecutive_errors = retry_count
 
             if using_resume_cursor or probing_resume_cursor:
                 if not self._verify_history_cursor_page(
@@ -1138,11 +1197,11 @@ class Pocket48Client:
                     continue
 
                 if probing_resume_cursor:
-                    logger.info(
+                    logger.debug(
                         "[%s] Resume history cursor verified and promoted", room_name
                     )
                 else:
-                    logger.info("[%s] Resume history cursor accepted", room_name)
+                    logger.debug("[%s] Resume history cursor accepted", room_name)
 
             page_messages = result["messages"]
             raw_count = result.get("raw_count", 0)
@@ -1176,7 +1235,7 @@ class Pocket48Client:
                 if oldest_raw_timestamp
                 else "N/A"
             )
-            logger.info(
+            logger.debug(
                 "[History %s] [collected %s] [elapsed %.0fs] [oldest %s]",
                 page_count,
                 total_fetched_count,
@@ -1211,7 +1270,9 @@ class Pocket48Client:
 
             if reached_target:
                 completed_successfully = True
-                logger.info("[%s] Stop: history target reached in page body", room_name)
+                logger.debug(
+                    "[%s] Stop: history target reached in page body", room_name
+                )
                 next_time = new_next_time
                 break
             if (
@@ -1219,19 +1280,19 @@ class Pocket48Client:
                 and oldest_raw_timestamp <= target_time_ms
             ):
                 completed_successfully = True
-                logger.info(
+                logger.debug(
                     "[%s] Stop: history target reached by raw boundary", room_name
                 )
                 next_time = new_next_time
                 break
             if not new_next_time:
                 completed_successfully = True
-                logger.info("[%s] Stop: no more messages", room_name)
+                logger.debug("[%s] Stop: no more messages", room_name)
                 next_time = new_next_time
                 break
             if new_next_time == requested_next_time:
                 completed_successfully = True
-                logger.info("[%s] Stop: pagination ended", room_name)
+                logger.debug("[%s] Stop: pagination ended", room_name)
                 next_time = new_next_time
                 break
 
@@ -1242,7 +1303,7 @@ class Pocket48Client:
                 consecutive_errors=consecutive_errors,
             )
             if last_logged_delay != effective_page_delay:
-                logger.info(
+                logger.debug(
                     "[%s] Page delay -> %ss",
                     room_name,
                     _format_delay(effective_page_delay),
@@ -1350,116 +1411,92 @@ class Pocket48Client:
         )
         return history_result["messages"]
 
-    def monitor_room(
+    def monitor_room_once(
         self,
         member: Dict[str, Any],
-        interval: int = 60,
-        limit: int = 100,
-        max_pages: Optional[int] = None,
-        max_retries: int = 5,
-    ):
+        limit: int,
+        max_pages: Optional[int],
+        state: Dict[str, Any],
+    ) -> Dict[str, Any]:
         room_id = str(member.get("channelId"))
         server_id = member.get("serverId")
         room_name = _member_display_name(member)
-        logger.info(
-            "Start monitoring room %s(%s), interval %s seconds",
-            room_name,
-            room_id,
-            interval,
-        )
-
-        consecutive_failures = 0
-        idle_success_count = 0
         token_retry_interval = self._token_retry_interval_seconds()
         success_heartbeat_every = self._success_heartbeat_every()
-        while True:
-            try:
-                messages = self.fetch_incremental_messages(
-                    member, limit=limit, max_pages=max_pages
-                )
+        try:
+            messages = self.fetch_incremental_messages(
+                member, limit=limit, max_pages=max_pages
+            )
 
-                if messages:
-                    saved = self.save_messages(messages)
-                    latest_message = max(
-                        messages, key=lambda item: item.get("timestamp") or 0
-                    )
-                    self.storage.record_fetch(
-                        room_id=room_id,
-                        messages_count=saved,
-                        status="success",
-                        last_message_id=latest_message.get("message_id"),
-                        last_message_time_ms=latest_message.get("timestamp"),
-                        server_id=server_id,
-                        channel_id=int(room_id),
-                    )
-                    logger.info(
-                        "Room %s(%s) saved %s new messages", room_name, room_id, saved
-                    )
-                    consecutive_failures = 0
-                    idle_success_count = 0
-                else:
-                    idle_success_count += 1
-                    if idle_success_count >= success_heartbeat_every:
-                        self.storage.record_fetch(
-                            room_id=room_id,
-                            messages_count=0,
-                            status="success",
-                            server_id=server_id,
-                            channel_id=int(room_id),
-                        )
-                        idle_success_count = 0
-                    consecutive_failures = 0
-
-                time.sleep(interval)
-
-            except AuthenticationUnavailableError as exc:
-                consecutive_failures = 0
-                logger.warning(
-                    "Auth unavailable for room %s(%s), retrying in %s seconds: %s",
-                    room_name,
-                    room_id,
-                    token_retry_interval,
-                    exc,
-                )
-                time.sleep(token_retry_interval)
-                self.reload_auth_state()
-            except KeyboardInterrupt:
-                logger.info("Stop monitoring room %s(%s)", room_name, room_id)
-                break
-            except Exception as exc:
-                consecutive_failures += 1
-                logger.error(
-                    "Monitor error %s(%s) [consecutive failures %s/%s]: %s",
-                    room_name,
-                    room_id,
-                    consecutive_failures,
-                    max_retries,
-                    exc,
+            if messages:
+                saved = self.save_messages(messages)
+                latest_message = max(
+                    messages, key=lambda item: item.get("timestamp") or 0
                 )
                 self.storage.record_fetch(
                     room_id=room_id,
-                    messages_count=0,
-                    status="failed",
-                    error_message=str(exc),
+                    messages_count=saved,
+                    status="success",
+                    last_message_id=latest_message.get("message_id"),
+                    last_message_time_ms=latest_message.get("timestamp"),
                     server_id=server_id,
                     channel_id=int(room_id),
                 )
-                if consecutive_failures >= max_retries:
-                    self.notifier.send_problem(
-                        event_key=f"room-monitor-failed:{room_id}",
-                        title=f"48messages 告警：{room_name} 连续抓取失败",
-                        desp=(
-                            f"房间 {room_name}({room_id}) 连续失败已达到 {consecutive_failures}/{max_retries}。\n\n"
-                            f"> 最近错误: {exc}"
-                        ),
+                logger.info(
+                    "Room %s(%s) saved %s new messages", room_name, room_id, saved
+                )
+                state["consecutive_failures"] = 0
+                state["idle_success_count"] = 0
+            else:
+                idle_success_count = int(state.get("idle_success_count", 0)) + 1
+                if idle_success_count >= success_heartbeat_every:
+                    self.storage.record_fetch(
+                        room_id=room_id,
+                        messages_count=0,
+                        status="success",
+                        server_id=server_id,
+                        channel_id=int(room_id),
                     )
-                    logger.error(
-                        "Room %s(%s) consecutive failures reached limit, stopping monitor",
-                        room_name,
-                        room_id,
-                    )
-                    break
-                time.sleep(interval * min(consecutive_failures, 3))
+                    idle_success_count = 0
+                state["idle_success_count"] = idle_success_count
+                state["consecutive_failures"] = 0
+            state["last_error"] = None
+            state["next_delay_seconds"] = 0
+            return state
+        except AuthenticationUnavailableError as exc:
+            logger.warning(
+                "Auth unavailable for room %s(%s), retrying in %s seconds: %s",
+                room_name,
+                room_id,
+                token_retry_interval,
+                exc,
+            )
+            self.reload_auth_state()
+            state["consecutive_failures"] = 0
+            state["last_error"] = str(exc)
+            state["next_delay_seconds"] = token_retry_interval
+            return state
+        except Exception as exc:
+            consecutive_failures = int(state.get("consecutive_failures", 0)) + 1
+            logger.error(
+                "Monitor error %s(%s) [consecutive failures %s]: %s",
+                room_name,
+                room_id,
+                consecutive_failures,
+                exc,
+            )
+            self.storage.record_fetch(
+                room_id=room_id,
+                messages_count=0,
+                status="failed",
+                error_message=str(exc),
+                server_id=server_id,
+                channel_id=int(room_id),
+            )
+            state["consecutive_failures"] = consecutive_failures
+            state["last_error"] = str(exc)
+            state["next_delay_seconds"] = 0
+            return state
 
 
 class MessageScraper:
@@ -1468,7 +1505,22 @@ class MessageScraper:
     def __init__(self, config_path: str = DEFAULT_CONFIG_PATH):
         self.client = Pocket48Client(config_path)
         self.config = self.client.config
-        self.threads: List[threading.Thread] = []
+
+    def _monitor_worker_count(self, members_count: int) -> int:
+        configured = self.config.get("monitor", {}).get("workers")
+        default_workers = min(max(members_count, 1), 8)
+        try:
+            requested = int(configured) if configured is not None else default_workers
+        except (TypeError, ValueError):
+            requested = default_workers
+        return max(1, min(requested, members_count))
+
+    def _monitor_jitter_seconds(self) -> float:
+        configured = self.config.get("monitor", {}).get("jitter_seconds", 3)
+        try:
+            return max(float(configured), 0.0)
+        except (TypeError, ValueError):
+            return 3.0
 
     def _select_members(
         self, member_names: Optional[List[str]] = None
@@ -1504,25 +1556,121 @@ class MessageScraper:
         limit = monitor_config.get("limit", 100)
         max_pages = monitor_config.get("max_pages")
         max_retries = monitor_config.get("max_retries", 5)
+        worker_count = self._monitor_worker_count(len(members))
+        jitter_seconds = self._monitor_jitter_seconds()
+        now = time.time()
+        states: Dict[str, Dict[str, Any]] = {}
+        active_members: Dict[str, Dict[str, Any]] = {}
 
         for member in members:
-            if (
-                member.get("channelId") is not None
-                and member.get("serverId") is not None
-            ):
-                thread = threading.Thread(
-                    target=self.client.monitor_room,
-                    args=(member, interval, limit, max_pages, max_retries),
-                    daemon=True,
+            if member.get("channelId") is None or member.get("serverId") is None:
+                logger.warning(
+                    "Skipping member config missing serverId/channelId: %s", member
                 )
-                thread.start()
-                self.threads.append(thread)
+                continue
+            room_id = str(member.get("channelId"))
+            active_members[room_id] = member
+            states[room_id] = {
+                "consecutive_failures": 0,
+                "idle_success_count": 0,
+                "running": False,
+                "next_run_at": now + random.uniform(0, jitter_seconds),
+                "last_error": None,
+                "next_delay_seconds": 0,
+            }
+            logger.info(
+                "Scheduled monitoring room %s(%s), interval %s seconds",
+                _member_display_name(member),
+                room_id,
+                interval,
+            )
 
-        logger.info("Started monitoring %s rooms", len(self.threads))
+        logger.info(
+            "Started monitoring %s rooms with %s workers",
+            len(active_members),
+            worker_count,
+        )
 
         try:
-            while True:
-                time.sleep(1)
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures: Dict[Any, str] = {}
+                while active_members or futures:
+                    current_time = time.time()
+
+                    completed_futures = [
+                        future for future in list(futures) if future.done()
+                    ]
+                    for future in completed_futures:
+                        room_id = futures.pop(future)
+                        member = active_members.get(room_id)
+                        if member is None or room_id not in states:
+                            continue
+
+                        updated_state = future.result()
+                        updated_state["running"] = False
+                        states[room_id] = updated_state
+                        next_delay_seconds = (
+                            updated_state.get("next_delay_seconds") or 0
+                        )
+                        delay_seconds = next_delay_seconds or interval
+                        updated_state["next_run_at"] = (
+                            time.time()
+                            + delay_seconds
+                            + random.uniform(0, jitter_seconds)
+                        )
+
+                        consecutive_failures = int(
+                            updated_state.get("consecutive_failures", 0)
+                        )
+                        if consecutive_failures >= max_retries:
+                            room_name = _member_display_name(member)
+                            last_error = (
+                                updated_state.get("last_error") or "unknown error"
+                            )
+                            self.client.notifier.send_problem(
+                                event_key=f"room-monitor-failed:{room_id}",
+                                title=f"48messages 告警：{room_name} 连续抓取失败",
+                                desp=(
+                                    f"房间 {room_name}({room_id}) 连续失败已达到 {consecutive_failures}/{max_retries}。\n\n"
+                                    f"> 最近错误: {last_error}"
+                                ),
+                            )
+                            logger.error(
+                                "Room %s(%s) consecutive failures reached limit, stopping monitor",
+                                room_name,
+                                room_id,
+                            )
+                            active_members.pop(room_id, None)
+                            states.pop(room_id, None)
+
+                    available_slots = worker_count - len(futures)
+                    if available_slots > 0:
+                        due_room_ids = [
+                            room_id
+                            for room_id, state in states.items()
+                            if not state.get("running")
+                            and state.get("next_run_at", 0) <= current_time
+                            and room_id in active_members
+                        ]
+                        due_room_ids.sort(
+                            key=lambda room_id: states[room_id]["next_run_at"]
+                        )
+
+                        for room_id in due_room_ids[:available_slots]:
+                            member = active_members[room_id]
+                            state = states[room_id]
+                            state["running"] = True
+                            futures[
+                                executor.submit(
+                                    self.client.monitor_room_once,
+                                    member,
+                                    limit,
+                                    max_pages,
+                                    dict(state),
+                                )
+                            ] = room_id
+
+                    time.sleep(0.5)
         except KeyboardInterrupt:
             logger.info("Stop monitoring")
 

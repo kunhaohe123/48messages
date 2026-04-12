@@ -42,6 +42,9 @@
     "token_retry_interval": 60,
     "limit": 100,
     "max_pages": 5,
+    "max_retries": 5,
+    "workers": 8,
+    "jitter_seconds": 3,
     "success_heartbeat_every": 10,
     "enabled": true
   },
