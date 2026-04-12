@@ -125,6 +125,12 @@ def _format_time_ms(timestamp_ms: Optional[int]) -> str:
     return datetime.fromtimestamp(timestamp_ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _format_delay(delay_seconds: float) -> str:
+    if delay_seconds == 0:
+        return "0"
+    return f"{delay_seconds:.1f}".rstrip("0").rstrip(".")
+
+
 def load_config(config_path: str) -> Dict[str, Any]:
     path = Path(config_path)
     if not path.exists():
@@ -263,7 +269,9 @@ class TokenManager:
         return self.token_data.get("access_token")
 
     def refresh_expiry(
-        self, expires_in: int = DEFAULT_TOKEN_REFRESH_TTL_SECONDS
+        self,
+        expires_in: int = DEFAULT_TOKEN_REFRESH_TTL_SECONDS,
+        log_refresh: bool = True,
     ) -> bool:
         if not self.has_token():
             return False
@@ -273,7 +281,8 @@ class TokenManager:
             return False
         self.token_data["expires_at"] = new_expires_at
         self._save_token()
-        logger.info("Token expiry refreshed")
+        if log_refresh:
+            logger.info("Token expiry refreshed")
         return True
 
     def clear(self):
@@ -391,9 +400,16 @@ class Pocket48Client:
             desp=(f"自动密码登录已被禁用，请更新抓包 token。\n\n> 原因: {reason}"),
         )
 
+    def _begin_fetch_round(self):
+        self._thread_local.token_refresh_logged = False
+
     def _mark_token_accepted(self):
         self.password_login_blocked_reason = None
-        self.token_manager.refresh_expiry(self._token_refresh_ttl_seconds())
+        already_logged = getattr(self._thread_local, "token_refresh_logged", False)
+        self.token_manager.refresh_expiry(
+            self._token_refresh_ttl_seconds(), log_refresh=not already_logged
+        )
+        self._thread_local.token_refresh_logged = True
         self.notifier.send_recovery(
             event_key="saved-token-rejected",
             title="48messages 恢复：token 已恢复",
@@ -782,14 +798,89 @@ class Pocket48Client:
             cursor_verified=cursor_verified,
         )
 
+    def _get_oldest_message_info(
+        self, messages: List[Dict[str, Any]]
+    ) -> tuple[Optional[str], Optional[int]]:
+        if not messages:
+            return None, None
+        oldest_message = min(messages, key=lambda item: item.get("timestamp") or 0)
+        return oldest_message.get("message_id"), oldest_message.get("timestamp") or 0
+
+    def _flush_history_buffer(
+        self,
+        member: Dict[str, Any],
+        buffered_messages: List[Dict[str, Any]],
+        persisted_oldest_message_id: Optional[str],
+        persisted_oldest_time_ms: Optional[int],
+        persisted_boundary_time_ms: Optional[int],
+        resume_next_time: Optional[int],
+        page_count: int,
+        cursor_verified: bool,
+    ) -> tuple[int, Optional[str], Optional[int]]:
+        if not buffered_messages and persisted_boundary_time_ms is None:
+            return 0, persisted_oldest_message_id, persisted_oldest_time_ms
+
+        saved_count = self.save_messages(buffered_messages) if buffered_messages else 0
+        batch_oldest_message_id, batch_oldest_time_ms = (None, None)
+        if buffered_messages:
+            batch_oldest_message_id, batch_oldest_time_ms = (
+                self._get_oldest_message_info(buffered_messages)
+            )
+        if batch_oldest_time_ms is not None and (
+            persisted_oldest_message_id is None
+            or batch_oldest_time_ms
+            < (persisted_oldest_time_ms or batch_oldest_time_ms + 1)
+        ):
+            persisted_oldest_message_id = batch_oldest_message_id
+        if persisted_boundary_time_ms is not None and (
+            persisted_oldest_time_ms is None
+            or persisted_boundary_time_ms < persisted_oldest_time_ms
+        ):
+            persisted_oldest_time_ms = persisted_boundary_time_ms
+
+        self._persist_history_progress_if_needed(
+            member=member,
+            page_count=page_count,
+            oldest_covered_message_id=persisted_oldest_message_id,
+            oldest_covered_time_ms=persisted_oldest_time_ms,
+            resume_next_time=resume_next_time,
+            cursor_verified=cursor_verified,
+            force=True,
+        )
+        buffered_messages.clear()
+        return saved_count, persisted_oldest_message_id, persisted_oldest_time_ms
+
+    def _get_adaptive_page_delay(
+        self,
+        page_count: int,
+        explicit_page_delay: Optional[float],
+        consecutive_errors: int = 0,
+    ) -> float:
+        if explicit_page_delay is not None:
+            return explicit_page_delay
+
+        if consecutive_errors >= 3:
+            return 2.0
+        if consecutive_errors == 2:
+            return 1.0
+        if consecutive_errors == 1:
+            return 0.5
+
+        if page_count <= 20:
+            return 0.0
+        if page_count <= 100:
+            return 0.1
+        return 0.3
+
     def fetch_latest_incremental_messages(
         self,
         member: Dict[str, Any],
         limit: int = 100,
         max_pages: Optional[int] = None,
-        page_delay: float = 1.0,
+        page_delay: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         self.ensure_authenticated()
+        self._begin_fetch_round()
         room_id = str(member.get("channelId"))
         room_name = _member_display_name(member)
         latest_local = self._get_latest_local_message(room_id)
@@ -801,6 +892,8 @@ class Pocket48Client:
         seen_message_ids = set()
         collected_messages: List[Dict[str, Any]] = []
         page_count = 0
+        consecutive_errors = 0
+        last_logged_delay: Optional[float] = None
         start_time = time.time()
         from datetime import datetime
 
@@ -888,7 +981,20 @@ class Pocket48Client:
                 logger.info("[%s] Stop: pagination ended", room_name)
                 break
             next_time = new_next_time
-            time.sleep(page_delay)
+            effective_page_delay = self._get_adaptive_page_delay(
+                page_count=page_count,
+                explicit_page_delay=page_delay,
+                consecutive_errors=consecutive_errors,
+            )
+            if last_logged_delay != effective_page_delay:
+                logger.info(
+                    "[%s] Page delay -> %ss",
+                    room_name,
+                    _format_delay(effective_page_delay),
+                )
+                last_logged_delay = effective_page_delay
+            if effective_page_delay > 0:
+                time.sleep(effective_page_delay)
 
         total_time = time.time() - start_time
         logger.info(
@@ -906,9 +1012,10 @@ class Pocket48Client:
         target_time_ms: int,
         limit: int = 100,
         max_pages: Optional[int] = None,
-        page_delay: float = 1.0,
+        page_delay: Optional[float] = None,
     ) -> Dict[str, Any]:
         self.ensure_authenticated()
+        self._begin_fetch_round()
         room_id = member.get("channelId")
         server_id = member.get("serverId")
         room_name = _member_display_name(member)
@@ -928,6 +1035,8 @@ class Pocket48Client:
             return {
                 "messages": [],
                 "page_count": 0,
+                "fetched_count": 0,
+                "saved_count": 0,
                 "oldest_covered_message_id": checkpoint.get("oldest_covered_message_id")
                 if checkpoint
                 else None,
@@ -960,12 +1069,12 @@ class Pocket48Client:
             self._resolve_history_fetch_start(checkpoint)
         )
         seen_message_ids = set()
-        collected_messages: List[Dict[str, Any]] = []
+        buffered_messages: List[Dict[str, Any]] = []
         page_count = 0
-        oldest_covered_time_ms = (
+        persisted_oldest_time_ms = (
             checkpoint.get("oldest_covered_time_ms") if checkpoint else None
         )
-        oldest_covered_message_id = (
+        persisted_oldest_message_id = (
             checkpoint.get("oldest_covered_message_id") if checkpoint else None
         )
         cursor_verified = bool(checkpoint and checkpoint.get("cursor_verified"))
@@ -973,6 +1082,11 @@ class Pocket48Client:
         completed_successfully = False
         failure_status = "interrupted"
         failure_message = "history fetch stopped before reaching target"
+        consecutive_errors = 0
+        last_logged_delay: Optional[float] = None
+        total_fetched_count = 0
+        total_saved_count = 0
+        persisted_boundary_time_ms = persisted_oldest_time_ms
         start_time = time.time()
         from datetime import datetime
 
@@ -1048,27 +1162,10 @@ class Pocket48Client:
                 if message_timestamp < target_time_ms:
                     reached_target = True
                     continue
-                collected_messages.append(message)
+                buffered_messages.append(message)
+                total_fetched_count += 1
                 if message_id:
                     seen_message_ids.add(message_id)
-
-            if oldest_raw_timestamp is not None and (
-                oldest_covered_time_ms is None
-                or oldest_raw_timestamp < oldest_covered_time_ms
-            ):
-                oldest_covered_time_ms = oldest_raw_timestamp
-
-            page_message_candidates = [
-                msg
-                for msg in page_messages
-                if (msg.get("timestamp") or 0) >= target_time_ms
-                and msg.get("message_id")
-            ]
-            if page_message_candidates:
-                oldest_message = min(
-                    page_message_candidates, key=lambda item: item.get("timestamp") or 0
-                )
-                oldest_covered_message_id = oldest_message.get("message_id")
 
             new_next_time = result["next_time"]
             elapsed = time.time() - start_time
@@ -1082,7 +1179,7 @@ class Pocket48Client:
             logger.info(
                 "[History %s] [collected %s] [elapsed %.0fs] [oldest %s]",
                 page_count,
-                len(collected_messages),
+                total_fetched_count,
                 elapsed,
                 oldest_str,
             )
@@ -1092,14 +1189,25 @@ class Pocket48Client:
                 using_resume_cursor = False
                 probing_resume_cursor = False
 
-            self._persist_history_progress_if_needed(
-                member=member,
-                page_count=page_count,
-                oldest_covered_message_id=oldest_covered_message_id,
-                oldest_covered_time_ms=oldest_covered_time_ms,
-                resume_next_time=new_next_time,
-                cursor_verified=cursor_verified,
-            )
+            if oldest_raw_timestamp is not None:
+                persisted_boundary_time_ms = oldest_raw_timestamp
+
+            if buffered_messages and (
+                page_count % 5 == 0 or len(buffered_messages) >= 200
+            ):
+                saved_count, persisted_oldest_message_id, persisted_oldest_time_ms = (
+                    self._flush_history_buffer(
+                        member=member,
+                        buffered_messages=buffered_messages,
+                        persisted_oldest_message_id=persisted_oldest_message_id,
+                        persisted_oldest_time_ms=persisted_oldest_time_ms,
+                        persisted_boundary_time_ms=persisted_boundary_time_ms,
+                        resume_next_time=new_next_time,
+                        page_count=page_count,
+                        cursor_verified=cursor_verified,
+                    )
+                )
+                total_saved_count += saved_count
 
             if reached_target:
                 completed_successfully = True
@@ -1128,34 +1236,66 @@ class Pocket48Client:
                 break
 
             next_time = new_next_time
-            time.sleep(page_delay)
+            effective_page_delay = self._get_adaptive_page_delay(
+                page_count=page_count,
+                explicit_page_delay=page_delay,
+                consecutive_errors=consecutive_errors,
+            )
+            if last_logged_delay != effective_page_delay:
+                logger.info(
+                    "[%s] Page delay -> %ss",
+                    room_name,
+                    _format_delay(effective_page_delay),
+                )
+                last_logged_delay = effective_page_delay
+            if effective_page_delay > 0:
+                time.sleep(effective_page_delay)
 
         total_time = time.time() - start_time
+        if buffered_messages:
+            saved_count, persisted_oldest_message_id, persisted_oldest_time_ms = (
+                self._flush_history_buffer(
+                    member=member,
+                    buffered_messages=buffered_messages,
+                    persisted_oldest_message_id=persisted_oldest_message_id,
+                    persisted_oldest_time_ms=persisted_oldest_time_ms,
+                    persisted_boundary_time_ms=persisted_boundary_time_ms,
+                    resume_next_time=next_time,
+                    page_count=page_count,
+                    cursor_verified=cursor_verified,
+                )
+            )
+            total_saved_count += saved_count
+        elif persisted_boundary_time_ms is not None:
+            _, persisted_oldest_message_id, persisted_oldest_time_ms = (
+                self._flush_history_buffer(
+                    member=member,
+                    buffered_messages=buffered_messages,
+                    persisted_oldest_message_id=persisted_oldest_message_id,
+                    persisted_oldest_time_ms=persisted_oldest_time_ms,
+                    persisted_boundary_time_ms=persisted_boundary_time_ms,
+                    resume_next_time=next_time,
+                    page_count=page_count,
+                    cursor_verified=cursor_verified,
+                )
+            )
         logger.info(
-            "[%s] History done: %spages %smessages %.1fs [target %s] [covered_to %s]",
+            "[%s] History done: %spages fetched %s saved %s %.1fs [target %s] [covered_to %s]",
             room_name,
             page_count,
-            len(collected_messages),
+            total_fetched_count,
+            total_saved_count,
             total_time,
             _format_time_ms(target_time_ms),
-            _format_time_ms(oldest_covered_time_ms),
-        )
-        self._persist_history_progress_if_needed(
-            member=member,
-            page_count=page_count,
-            oldest_covered_message_id=oldest_covered_message_id,
-            oldest_covered_time_ms=oldest_covered_time_ms,
-            resume_next_time=next_time,
-            cursor_verified=cursor_verified,
-            force=True,
+            _format_time_ms(persisted_oldest_time_ms),
         )
         if completed_successfully:
             self.storage.finish_history_fetch_success(
                 server_id=int(server_id),
                 channel_id=int(room_id),
                 target_time_ms=target_time_ms,
-                oldest_covered_message_id=oldest_covered_message_id,
-                oldest_covered_time_ms=oldest_covered_time_ms,
+                oldest_covered_message_id=persisted_oldest_message_id,
+                oldest_covered_time_ms=persisted_oldest_time_ms,
                 resume_next_time=next_time,
                 last_page_count=page_count,
                 cursor_verified=cursor_verified,
@@ -1170,14 +1310,16 @@ class Pocket48Client:
                 last_page_count=page_count,
             )
         return {
-            "messages": collected_messages,
+            "messages": [],
             "page_count": page_count,
-            "oldest_covered_message_id": oldest_covered_message_id,
-            "oldest_covered_time_ms": oldest_covered_time_ms,
+            "fetched_count": total_fetched_count,
+            "saved_count": total_saved_count,
+            "oldest_covered_message_id": persisted_oldest_message_id,
+            "oldest_covered_time_ms": persisted_oldest_time_ms,
             "resume_next_time": next_time,
             "reached_target": (
-                oldest_covered_time_ms is not None
-                and oldest_covered_time_ms <= target_time_ms
+                persisted_oldest_time_ms is not None
+                and persisted_oldest_time_ms <= target_time_ms
             ),
             "cursor_verified": cursor_verified,
             "cursor_invalid": cursor_invalid,
@@ -1189,7 +1331,7 @@ class Pocket48Client:
         limit: int = 100,
         since_time_ms: Optional[int] = None,
         max_pages: Optional[int] = None,
-        page_delay: float = 1.0,
+        page_delay: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         if since_time_ms is None:
             return self.fetch_latest_incremental_messages(
@@ -1390,7 +1532,7 @@ class MessageScraper:
         fetch_limit: int,
         since_time_ms: Optional[int] = None,
         max_pages: Optional[int] = None,
-        page_delay: float = 1.0,
+        page_delay: Optional[float] = None,
     ):
         if since_time_ms is None:
             self._run_member_once_latest(
@@ -1413,7 +1555,7 @@ class MessageScraper:
         member: Dict[str, Any],
         fetch_limit: int,
         max_pages: Optional[int] = None,
-        page_delay: float = 1.0,
+        page_delay: Optional[float] = None,
     ):
         room_id = member.get("channelId")
         server_id = member.get("serverId")
@@ -1479,7 +1621,7 @@ class MessageScraper:
         fetch_limit: int,
         target_time_ms: int,
         max_pages: Optional[int] = None,
-        page_delay: float = 1.0,
+        page_delay: Optional[float] = None,
     ):
         room_id = member.get("channelId")
         server_id = member.get("serverId")
@@ -1498,11 +1640,9 @@ class MessageScraper:
                 max_pages=max_pages,
                 page_delay=page_delay,
             )
-            messages = history_result["messages"]
-            saved = self.client.save_messages(messages) if messages else 0
             self.client.storage.record_fetch(
                 room_id=str(room_id),
-                messages_count=saved,
+                messages_count=history_result["saved_count"],
                 status="success",
                 server_id=server_id,
                 channel_id=room_id,
@@ -1511,8 +1651,8 @@ class MessageScraper:
                 "One-time history fetch %s(%s): fetched %s, saved %s, pages %s, target %s, covered_to %s",
                 room_name,
                 room_id,
-                len(messages),
-                saved,
+                history_result["fetched_count"],
+                history_result["saved_count"],
                 history_result["page_count"],
                 _format_time_ms(target_time_ms),
                 _format_time_ms(history_result["oldest_covered_time_ms"]),
@@ -1571,19 +1711,22 @@ class MessageScraper:
         worker_count = max_workers or len(members)
         worker_count = max(1, min(worker_count, len(members)))
         since_time_ms = None
-        effective_page_delay = page_delay
+        explicit_page_delay = page_delay
         if since_days is not None:
             since_time_ms = int((time.time() - since_days * 24 * 60 * 60) * 1000)
-            if effective_page_delay is None:
-                effective_page_delay = 0.0 if since_days <= 30 else 0.3
-        elif effective_page_delay is None:
-            effective_page_delay = 0.3
-        logger.info(
-            "开始单次抓取 %s 个成员，并发 %s，翻页间隔 %.1f 秒",
-            len(members),
-            worker_count,
-            effective_page_delay,
-        )
+        if explicit_page_delay is None:
+            logger.info(
+                "开始单次抓取 %s 个成员，并发 %s，翻页间隔自适应（1-20页=0s，21-100页=0.1s，100页后=0.3s）",
+                len(members),
+                worker_count,
+            )
+        else:
+            logger.info(
+                "开始单次抓取 %s 个成员，并发 %s，翻页间隔 %.1f 秒",
+                len(members),
+                worker_count,
+                explicit_page_delay,
+            )
 
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = [
@@ -1593,7 +1736,7 @@ class MessageScraper:
                     fetch_limit,
                     since_time_ms,
                     max_pages,
-                    effective_page_delay,
+                    explicit_page_delay,
                 )
                 for member in members
             ]
