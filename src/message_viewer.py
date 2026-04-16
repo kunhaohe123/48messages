@@ -122,7 +122,8 @@ def render_layout(title: str, body: str) -> str:
     .cell-type {{ width: 110px; }}
     .cell-time {{ width: 220px; white-space: nowrap; }}
     .content {{ width: 100%; white-space: pre-wrap; word-break: break-word; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; position: relative; line-height: 1.5; }}
-    .content-truncated {{ cursor: pointer; color: #94a3b8; font-size: 12px; margin-top: 4px; }}
+    .content-link {{ display: block; color: inherit; text-decoration: none; }}
+    .content-link:hover {{ text-decoration: underline; color: #38bdf8; }}
     .badge {{ display: inline-block; padding: 4px 8px; background: #1e293b; border: 1px solid #334155; border-radius: 999px; font-size: 12px; font-weight: 500; }}
     .badge-member {{ background: #3b0764; border-color: #7c3aed; color: #f5d0fe; }}
     .badge-TEXT {{ background: #0f172a; border-color: #334155; }}
@@ -143,8 +144,6 @@ def render_layout(title: str, body: str) -> str:
     .toolbar {{ display: flex; gap: 12px; flex-wrap: wrap; }}
     .toolbar a {{ padding: 8px 12px; background: #0f172a; border: 1px solid #334155; border-radius: 999px; font-size: 14px; transition: all 0.2s ease; }}
     .toolbar a:hover {{ background: #1e293b; border-color: #475569; transform: translateY(-1px); }}
-    .loading {{ display: inline-block; width: 16px; height: 16px; border: 2px solid #334155; border-radius: 50%; border-top-color: #2563eb; animation: spin 1s ease-in-out infinite; }}
-    @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
     @media (max-width: 900px) {{
       .wrap {{ padding: 16px; }}
       .panel {{ padding: 16px; border-radius: 14px; }}
@@ -302,7 +301,27 @@ def render_layout(title: str, body: str) -> str:
   <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
   <script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/l10n/zh.js"></script>
   <script>
+    function loadSummaryStats() {{
+      fetch('/stats-summary')
+        .then(function(r) {{ return r.json(); }})
+        .then(function(data) {{
+          var totalEl = document.getElementById('stats-total-messages');
+          if (totalEl) totalEl.textContent = data.total_messages;
+          var roomsEl = document.getElementById('stats-total-rooms');
+          if (roomsEl) roomsEl.textContent = data.total_rooms;
+          var todayEl = document.getElementById('stats-today-messages');
+          if (todayEl) todayEl.textContent = data.today_messages;
+          var topCountEl = document.getElementById('stats-top-member-count');
+          if (topCountEl) topCountEl.textContent = data.top_member_count;
+          var topNameEl = document.getElementById('stats-top-member-name');
+          if (topNameEl) topNameEl.textContent = '今日话痨：' + (data.top_member_name || '--');
+        }})
+        .catch(function() {{}});
+    }}
+
     document.addEventListener('DOMContentLoaded', function() {{
+      loadSummaryStats();
+
       // CDN 不可用时退回原生 date input，避免页面脚本直接报错。
       if (typeof flatpickr !== 'function') {{
         return;
@@ -391,6 +410,28 @@ def create_app(config_path: str) -> Flask:
     storage = create_storage(config)
     app = Flask(__name__)
 
+    _summary_cache: Dict[str, Any] = {"value": None, "expires_at": 0}
+    _rooms_cache: Dict[str, Any] = {"value": None, "expires_at": 0}
+    _CACHE_TTL_SECONDS = 30
+
+    def _get_cached_summary_stats() -> Dict[str, Any]:
+        now = datetime.now().timestamp()
+        if _summary_cache["value"] is not None and _summary_cache["expires_at"] > now:
+            return _summary_cache["value"]
+        value = build_summary_stats()
+        _summary_cache["value"] = value
+        _summary_cache["expires_at"] = now + _CACHE_TTL_SECONDS
+        return value
+
+    def _get_cached_rooms() -> list:
+        now = datetime.now().timestamp()
+        if _rooms_cache["value"] is not None and _rooms_cache["expires_at"] > now:
+            return _rooms_cache["value"]
+        value = storage.list_rooms()
+        _rooms_cache["value"] = value
+        _rooms_cache["expires_at"] = now + _CACHE_TTL_SECONDS
+        return value
+
     def build_summary_stats() -> Dict[str, Any]:
         today_start = int(
             datetime.now()
@@ -427,7 +468,7 @@ def create_app(config_path: str) -> Flask:
 
     @app.route("/stats-summary")
     def stats_summary() -> Any:
-        return jsonify(build_summary_stats())
+        return jsonify(_get_cached_summary_stats())
 
     @app.route("/")
     def index() -> str:
@@ -444,8 +485,7 @@ def create_app(config_path: str) -> Flask:
         end_time_ms = parse_datetime_local(end_time, is_end=True) if end_time else None
         offset = (page - 1) * page_size
 
-        rooms = storage.list_rooms()
-        summary_stats = build_summary_stats()
+        rooms = _get_cached_rooms()
 
         search_kwargs = {
             "room_id": room_id,
@@ -493,12 +533,19 @@ def create_app(config_path: str) -> Flask:
                 or "-"
             )
             room_name = item.get("room_name") or item.get("room_id")
-            msg_type_class = f"badge-{item.get('msg_type') or 'TEXT'}"
+            msg_id = html.escape(
+                str(
+                    item.get("message_id")
+                    or item.get("msg_id")
+                    or item.get("id")
+                    or "-"
+                )
+            )
             message_rows.append(
                 f"""
                 <tr>
                   <td data-label="房间" class="cell-room">{html.escape(str(room_name))}</td>
-                  <td data-label="内容" title="{html.escape(str(content))}"><div class="content">{html.escape(str(content))}</div></td>
+                  <td data-label="内容"><a class="content content-link" href="/messages/{msg_id}" title="{html.escape(str(content))}">{html.escape(str(content))}</a></td>
                   <td data-label="时间" class="cell-time">{html.escape(format_timestamp(item.get("timestamp")))}</td>
                 </tr>
                 """
@@ -516,29 +563,29 @@ def create_app(config_path: str) -> Flask:
           <div class="stat">
             <div class="stat-icon">💬</div>
             <div class="stat-content">
-              <div class="stat-value">{summary_stats["total_messages"]}</div>
+              <div class="stat-value" id="stats-total-messages">--</div>
               <div class="stat-label">总消息数</div>
             </div>
           </div>
           <div class="stat">
             <div class="stat-icon">🏠</div>
             <div class="stat-content">
-              <div class="stat-value">{len(rooms)}</div>
+              <div class="stat-value" id="stats-total-rooms">--</div>
               <div class="stat-label">房间数</div>
             </div>
           </div>
           <div class="stat">
             <div class="stat-icon">📅</div>
             <div class="stat-content">
-              <div class="stat-value">{summary_stats["today_messages"]}</div>
+              <div class="stat-value" id="stats-today-messages">--</div>
               <div class="stat-label">今日消息数</div>
             </div>
           </div>
           <div class="stat">
             <div class="stat-icon">⏰</div>
             <div class="stat-content">
-              <div class="stat-value">{html.escape(str(summary_stats["top_member_count"]))}</div>
-              <div class="stat-label">今日话痨：{html.escape(str(summary_stats["top_member_name"]))}</div>
+              <div class="stat-value" id="stats-top-member-count">--</div>
+              <div class="stat-label" id="stats-top-member-name">今日话痨：--</div>
             </div>
           </div>
         </div>
