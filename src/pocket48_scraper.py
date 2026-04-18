@@ -1780,6 +1780,16 @@ class MessageScraper:
             )
             return
 
+        def _get_persisted_history_progress() -> tuple[Optional[int], int]:
+            checkpoint = self.client.storage.get_history_checkpoint(
+                int(server_id), int(room_id)
+            )
+            if not checkpoint:
+                return None, 0
+            return checkpoint.get("resume_next_time"), int(
+                checkpoint.get("last_page_count") or 0
+            )
+
         try:
             history_result = self.client.fetch_history_messages(
                 member,
@@ -1806,23 +1816,25 @@ class MessageScraper:
                 _format_time_ms(history_result["oldest_covered_time_ms"]),
             )
         except KeyboardInterrupt:
+            resume_next_time, last_page_count = _get_persisted_history_progress()
             self.client.storage.finish_history_fetch_failed(
                 server_id=int(server_id),
                 channel_id=int(room_id),
                 status="interrupted",
                 error_message="history fetch interrupted by user",
-                resume_next_time=None,
-                last_page_count=0,
+                resume_next_time=resume_next_time,
+                last_page_count=last_page_count,
             )
             raise
         except Exception as exc:
+            resume_next_time, last_page_count = _get_persisted_history_progress()
             self.client.storage.finish_history_fetch_failed(
                 server_id=int(server_id),
                 channel_id=int(room_id),
                 status="failed",
                 error_message=str(exc),
-                resume_next_time=None,
-                last_page_count=0,
+                resume_next_time=resume_next_time,
+                last_page_count=last_page_count,
             )
             self.client.storage.record_fetch(
                 room_id=str(room_id),

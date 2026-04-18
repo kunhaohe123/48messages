@@ -486,6 +486,7 @@ def create_app(config_path: str) -> Flask:
         offset = (page - 1) * page_size
 
         rooms = _get_cached_rooms()
+        summary_stats = _get_cached_summary_stats()
 
         search_kwargs = {
             "room_id": room_id,
@@ -563,29 +564,29 @@ def create_app(config_path: str) -> Flask:
           <div class="stat">
             <div class="stat-icon">💬</div>
             <div class="stat-content">
-              <div class="stat-value" id="stats-total-messages">--</div>
+              <div class="stat-value" id="stats-total-messages">{summary_stats["total_messages"]}</div>
               <div class="stat-label">总消息数</div>
             </div>
           </div>
           <div class="stat">
             <div class="stat-icon">🏠</div>
             <div class="stat-content">
-              <div class="stat-value" id="stats-total-rooms">--</div>
+              <div class="stat-value" id="stats-total-rooms">{summary_stats["total_rooms"]}</div>
               <div class="stat-label">房间数</div>
             </div>
           </div>
           <div class="stat">
             <div class="stat-icon">📅</div>
             <div class="stat-content">
-              <div class="stat-value" id="stats-today-messages">--</div>
+              <div class="stat-value" id="stats-today-messages">{summary_stats["today_messages"]}</div>
               <div class="stat-label">今日消息数</div>
             </div>
           </div>
           <div class="stat">
             <div class="stat-icon">⏰</div>
             <div class="stat-content">
-              <div class="stat-value" id="stats-top-member-count">--</div>
-              <div class="stat-label" id="stats-top-member-name">今日话痨：--</div>
+              <div class="stat-value" id="stats-top-member-count">{html.escape(str(summary_stats["top_member_count"]))}</div>
+              <div class="stat-label" id="stats-top-member-name">今日话痨：{html.escape(str(summary_stats["top_member_name"]))}</div>
             </div>
           </div>
         </div>
