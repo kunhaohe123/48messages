@@ -5,9 +5,8 @@ from datetime import datetime, timedelta
 from math import ceil
 from pathlib import Path
 from typing import Any, Dict, Optional
-from urllib.parse import urlencode
-
-from flask import Flask, abort, jsonify, request
+from flask import Flask, abort, jsonify, request, url_for
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from message_storage import create_storage
 from pocket48_scraper import DEFAULT_CONFIG_PATH, load_config
@@ -47,13 +46,6 @@ def parse_datetime_local(value: str, is_end: bool = False) -> Optional[int]:
     if len(value) == 10 and is_end:
         dt = dt + timedelta(days=1) - timedelta(milliseconds=1)
     return int(dt.timestamp() * 1000)
-
-
-def build_query_string(params: Dict[str, Any]) -> str:
-    pairs = {
-        key: str(value) for key, value in params.items() if value not in ("", None)
-    }
-    return f"&{urlencode(pairs)}" if pairs else ""
 
 
 def render_layout(title: str, body: str) -> str:
@@ -122,8 +114,7 @@ def render_layout(title: str, body: str) -> str:
     .cell-type {{ width: 110px; }}
     .cell-time {{ width: 220px; white-space: nowrap; }}
     .content {{ width: 100%; white-space: pre-wrap; word-break: break-word; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; position: relative; line-height: 1.5; }}
-    .content-link {{ display: block; color: inherit; text-decoration: none; }}
-    .content-link:hover {{ text-decoration: underline; color: #38bdf8; }}
+    .content-truncated {{ cursor: pointer; color: #94a3b8; font-size: 12px; margin-top: 4px; }}
     .badge {{ display: inline-block; padding: 4px 8px; background: #1e293b; border: 1px solid #334155; border-radius: 999px; font-size: 12px; font-weight: 500; }}
     .badge-member {{ background: #3b0764; border-color: #7c3aed; color: #f5d0fe; }}
     .badge-TEXT {{ background: #0f172a; border-color: #334155; }}
@@ -144,6 +135,8 @@ def render_layout(title: str, body: str) -> str:
     .toolbar {{ display: flex; gap: 12px; flex-wrap: wrap; }}
     .toolbar a {{ padding: 8px 12px; background: #0f172a; border: 1px solid #334155; border-radius: 999px; font-size: 14px; transition: all 0.2s ease; }}
     .toolbar a:hover {{ background: #1e293b; border-color: #475569; transform: translateY(-1px); }}
+    .loading {{ display: inline-block; width: 16px; height: 16px; border: 2px solid #334155; border-radius: 50%; border-top-color: #2563eb; animation: spin 1s ease-in-out infinite; }}
+    @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
     @media (max-width: 900px) {{
       .wrap {{ padding: 16px; }}
       .panel {{ padding: 16px; border-radius: 14px; }}
@@ -301,27 +294,7 @@ def render_layout(title: str, body: str) -> str:
   <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
   <script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/l10n/zh.js"></script>
   <script>
-    function loadSummaryStats() {{
-      fetch('/stats-summary')
-        .then(function(r) {{ return r.json(); }})
-        .then(function(data) {{
-          var totalEl = document.getElementById('stats-total-messages');
-          if (totalEl) totalEl.textContent = data.total_messages;
-          var roomsEl = document.getElementById('stats-total-rooms');
-          if (roomsEl) roomsEl.textContent = data.total_rooms;
-          var todayEl = document.getElementById('stats-today-messages');
-          if (todayEl) todayEl.textContent = data.today_messages;
-          var topCountEl = document.getElementById('stats-top-member-count');
-          if (topCountEl) topCountEl.textContent = data.top_member_count;
-          var topNameEl = document.getElementById('stats-top-member-name');
-          if (topNameEl) topNameEl.textContent = '今日话痨：' + (data.top_member_name || '--');
-        }})
-        .catch(function() {{}});
-    }}
-
     document.addEventListener('DOMContentLoaded', function() {{
-      loadSummaryStats();
-
       // CDN 不可用时退回原生 date input，避免页面脚本直接报错。
       if (typeof flatpickr !== 'function') {{
         return;
@@ -409,28 +382,7 @@ def create_app(config_path: str) -> Flask:
     config = load_config(config_path)
     storage = create_storage(config)
     app = Flask(__name__)
-
-    _summary_cache: Dict[str, Any] = {"value": None, "expires_at": 0}
-    _rooms_cache: Dict[str, Any] = {"value": None, "expires_at": 0}
-    _CACHE_TTL_SECONDS = 30
-
-    def _get_cached_summary_stats() -> Dict[str, Any]:
-        now = datetime.now().timestamp()
-        if _summary_cache["value"] is not None and _summary_cache["expires_at"] > now:
-            return _summary_cache["value"]
-        value = build_summary_stats()
-        _summary_cache["value"] = value
-        _summary_cache["expires_at"] = now + _CACHE_TTL_SECONDS
-        return value
-
-    def _get_cached_rooms() -> list:
-        now = datetime.now().timestamp()
-        if _rooms_cache["value"] is not None and _rooms_cache["expires_at"] > now:
-            return _rooms_cache["value"]
-        value = storage.list_rooms()
-        _rooms_cache["value"] = value
-        _rooms_cache["expires_at"] = now + _CACHE_TTL_SECONDS
-        return value
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_prefix=1)
 
     def build_summary_stats() -> Dict[str, Any]:
         today_start = int(
@@ -468,7 +420,7 @@ def create_app(config_path: str) -> Flask:
 
     @app.route("/stats-summary")
     def stats_summary() -> Any:
-        return jsonify(_get_cached_summary_stats())
+        return jsonify(build_summary_stats())
 
     @app.route("/")
     def index() -> str:
@@ -485,8 +437,8 @@ def create_app(config_path: str) -> Flask:
         end_time_ms = parse_datetime_local(end_time, is_end=True) if end_time else None
         offset = (page - 1) * page_size
 
-        rooms = _get_cached_rooms()
-        summary_stats = _get_cached_summary_stats()
+        rooms = storage.list_rooms()
+        summary_stats = build_summary_stats()
 
         search_kwargs = {
             "room_id": room_id,
@@ -515,7 +467,10 @@ def create_app(config_path: str) -> Flask:
             "page_size": page_size,
         }
 
-        query_without_page = build_query_string(filters)
+        def build_index_url(target_page: int) -> str:
+            query = {key: value for key, value in filters.items() if value not in ("", None)}
+            query["page"] = target_page
+            return url_for("index", **query)
 
         options = ['<option value="">全部房间</option>']
         for room in rooms:
@@ -534,19 +489,11 @@ def create_app(config_path: str) -> Flask:
                 or "-"
             )
             room_name = item.get("room_name") or item.get("room_id")
-            msg_id = html.escape(
-                str(
-                    item.get("message_id")
-                    or item.get("msg_id")
-                    or item.get("id")
-                    or "-"
-                )
-            )
             message_rows.append(
                 f"""
                 <tr>
                   <td data-label="房间" class="cell-room">{html.escape(str(room_name))}</td>
-                  <td data-label="内容"><a class="content content-link" href="/messages/{msg_id}" title="{html.escape(str(content))}">{html.escape(str(content))}</a></td>
+                  <td data-label="内容" title="{html.escape(str(content))}"><div class="content">{html.escape(str(content))}</div></td>
                   <td data-label="时间" class="cell-time">{html.escape(format_timestamp(item.get("timestamp")))}</td>
                 </tr>
                 """
@@ -557,36 +504,36 @@ def create_app(config_path: str) -> Flask:
           <div>
             <h1>口袋房间消息查看</h1>
           </div>
-          <div class="toolbar"><a href="/">刷新</a></div>
+          <div class="toolbar"><a href="{url_for("index")}">刷新</a></div>
         </div>
 
         <div class="panel stats">
           <div class="stat">
             <div class="stat-icon">💬</div>
             <div class="stat-content">
-              <div class="stat-value" id="stats-total-messages">{summary_stats["total_messages"]}</div>
+              <div class="stat-value">{summary_stats["total_messages"]}</div>
               <div class="stat-label">总消息数</div>
             </div>
           </div>
           <div class="stat">
             <div class="stat-icon">🏠</div>
             <div class="stat-content">
-              <div class="stat-value" id="stats-total-rooms">{summary_stats["total_rooms"]}</div>
+              <div class="stat-value">{len(rooms)}</div>
               <div class="stat-label">房间数</div>
             </div>
           </div>
           <div class="stat">
             <div class="stat-icon">📅</div>
             <div class="stat-content">
-              <div class="stat-value" id="stats-today-messages">{summary_stats["today_messages"]}</div>
+              <div class="stat-value">{summary_stats["today_messages"]}</div>
               <div class="stat-label">今日消息数</div>
             </div>
           </div>
           <div class="stat">
             <div class="stat-icon">⏰</div>
             <div class="stat-content">
-              <div class="stat-value" id="stats-top-member-count">{html.escape(str(summary_stats["top_member_count"]))}</div>
-              <div class="stat-label" id="stats-top-member-name">今日话痨：{html.escape(str(summary_stats["top_member_name"]))}</div>
+              <div class="stat-value">{html.escape(str(summary_stats["top_member_count"]))}</div>
+              <div class="stat-label">今日话痨：{html.escape(str(summary_stats["top_member_name"]))}</div>
             </div>
           </div>
         </div>
@@ -642,9 +589,9 @@ def create_app(config_path: str) -> Flask:
 
         <div class="panel pager">
           <span>第 {page} / {total_pages} 页，共 {total} 条</span>
-          <a href="/?page=1{query_without_page}">首页</a>
-          <a href="/?page={max(page - 1, 1)}{query_without_page}">上一页</a>
-          <a href="/?page={min(page + 1, total_pages)}{query_without_page}">下一页</a>
+          <a href="{build_index_url(1)}">首页</a>
+          <a href="{build_index_url(max(page - 1, 1))}">上一页</a>
+          <a href="{build_index_url(min(page + 1, total_pages))}">下一页</a>
           <form method="get" style="display:inline-flex;gap:8px;align-items:center;">
             {"".join(f'<input type="hidden" name="{k}" value="{html.escape(str(v))}">' for k, v in filters.items() if v)}
             <label style="margin:0;font-size:12px;display:flex;align-items:center;gap:4px;">跳至<input type="number" name="page" min="1" max="{total_pages}" value="{page}" style="width:60px;padding:4px 8px;"></label>
@@ -666,7 +613,7 @@ def create_app(config_path: str) -> Flask:
             <h1>消息详情</h1>
             <div class="mono">{html.escape(str(message_id))}</div>
           </div>
-          <div class="toolbar"><a href="/">返回列表</a></div>
+          <div class="toolbar"><a href="{url_for("index")}">返回列表</a></div>
         </div>
 
         <div class="grid">
