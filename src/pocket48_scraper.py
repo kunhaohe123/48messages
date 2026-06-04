@@ -363,7 +363,7 @@ class Pocket48Client:
         return session
 
     def _init_storage(self) -> MessageStorage:
-        return create_storage(self.config)
+        return create_storage(self.config, initialize_schema=False)
 
     def _api_config(self) -> Dict[str, Any]:
         return self.config.get("api", {})
@@ -1679,16 +1679,15 @@ class MessageScraper:
         since_time_ms: Optional[int] = None,
         max_pages: Optional[int] = None,
         page_delay: Optional[float] = None,
-    ):
+    ) -> bool:
         if since_time_ms is None:
-            self._run_member_once_latest(
+            return self._run_member_once_latest(
                 member,
                 fetch_limit=fetch_limit,
                 max_pages=max_pages,
                 page_delay=page_delay,
             )
-            return
-        self._run_member_once_history(
+        return self._run_member_once_history(
             member,
             fetch_limit=fetch_limit,
             target_time_ms=since_time_ms,
@@ -1702,7 +1701,7 @@ class MessageScraper:
         fetch_limit: int,
         max_pages: Optional[int] = None,
         page_delay: Optional[float] = None,
-    ):
+    ) -> bool:
         room_id = member.get("channelId")
         server_id = member.get("serverId")
         room_name = _member_display_name(member)
@@ -1710,7 +1709,7 @@ class MessageScraper:
             logger.warning(
                 "Skipping member config missing serverId/channelId: %s", member
             )
-            return
+            return False
 
         try:
             messages = self.client.fetch_latest_incremental_messages(
@@ -1750,6 +1749,7 @@ class MessageScraper:
                 len(messages),
                 saved,
             )
+            return True
         except Exception as exc:
             self.client.storage.record_fetch(
                 room_id=str(room_id),
@@ -1760,6 +1760,7 @@ class MessageScraper:
                 channel_id=room_id,
             )
             logger.error("One-time fetch error %s(%s): %s", room_name, room_id, exc)
+            return False
 
     def _run_member_once_history(
         self,
@@ -1768,7 +1769,7 @@ class MessageScraper:
         target_time_ms: int,
         max_pages: Optional[int] = None,
         page_delay: Optional[float] = None,
-    ):
+    ) -> bool:
         room_id = member.get("channelId")
         server_id = member.get("serverId")
         room_name = _member_display_name(member)
@@ -1776,7 +1777,7 @@ class MessageScraper:
             logger.warning(
                 "Skipping member config missing serverId/channelId: %s", member
             )
-            return
+            return False
 
         def _get_persisted_history_progress() -> tuple[Optional[int], int]:
             checkpoint = self.client.storage.get_history_checkpoint(
@@ -1813,6 +1814,7 @@ class MessageScraper:
                 _format_time_ms(target_time_ms),
                 _format_time_ms(history_result["oldest_covered_time_ms"]),
             )
+            return True
         except KeyboardInterrupt:
             resume_next_time, last_page_count = _get_persisted_history_progress()
             self.client.storage.finish_history_fetch_failed(
@@ -1845,6 +1847,7 @@ class MessageScraper:
             logger.error(
                 "One-time history fetch error %s(%s): %s", room_name, room_id, exc
             )
+            return False
 
     def run_once(
         self,
@@ -1898,8 +1901,13 @@ class MessageScraper:
                 )
                 for member in members
             ]
+            failed_count = 0
             for future in as_completed(futures):
-                future.result()
+                if not future.result():
+                    failed_count += 1
+
+        if failed_count:
+            raise RuntimeError(f"One-time fetch failed for {failed_count} member(s)")
 
     def export(
         self,
@@ -1929,6 +1937,14 @@ def print_statistics(stats: Dict[str, Any]):
     print("\nTop 10 rooms by message count:")
     for room, count in stats["top_rooms"]:
         print(f"  {room}: {count}")
+
+
+def run_migrations(config_path: str) -> int:
+    config = load_config(config_path)
+    storage = create_storage(config, initialize_schema=True)
+    synced_count = storage.sync_members(config.get("members", []))
+    logger.info("Migration complete; synced %s member records", synced_count)
+    return synced_count
 
 
 def main():
@@ -1963,10 +1979,18 @@ def main():
         help="Delay between pages in seconds (default: 0 for <=30 days, otherwise 0.3)",
     )
     parser.add_argument("--stats", action="store_true", help="Show scrape statistics")
+    parser.add_argument(
+        "--migrate",
+        action="store_true",
+        help="Initialize or migrate database schema, then exit",
+    )
     args = parser.parse_args()
     _configure_logging(for_once=args.once)
 
     try:
+        if args.migrate:
+            run_migrations(args.config)
+            return
         scraper = MessageScraper(args.config)
         if args.stats:
             print_statistics(scraper.get_statistics())

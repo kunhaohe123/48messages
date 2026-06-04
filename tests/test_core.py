@@ -23,10 +23,11 @@ from message_parser import (  # noqa: E402
 )
 from message_normalizer import normalize_room_messages  # noqa: E402
 from message_viewer import create_app  # noqa: E402
-from message_storage import create_storage  # noqa: E402
+from message_storage import StorageConfigError, create_storage  # noqa: E402
 from mysql_storage import MySQLStorage  # noqa: E402
 from pocket48_scraper import (  # noqa: E402
     AuthenticationUnavailableError,
+    MessageScraper,
     Pocket48Client,
     TokenManager,
     _normalize_member_config,
@@ -145,6 +146,35 @@ class ConfigTests(unittest.TestCase):
             )
 
         self.assertEqual(storage_cls.call_args.kwargs["password"], "")
+
+    def test_create_mysql_storage_can_skip_schema_initialization(self):
+        with mock.patch("mysql_storage.MySQLStorage") as storage_cls:
+            create_storage(
+                {
+                    "storage": {
+                        "type": "mysql",
+                        "host": "localhost",
+                        "database": "48pocket",
+                        "user": "root",
+                    }
+                },
+                initialize_schema=False,
+            )
+
+        self.assertFalse(storage_cls.call_args.kwargs["initialize_schema"])
+
+    def test_create_mysql_storage_rejects_unsafe_database_name(self):
+        with self.assertRaises(StorageConfigError):
+            create_storage(
+                {
+                    "storage": {
+                        "type": "mysql",
+                        "host": "localhost",
+                        "database": "48pocket`; DROP DATABASE mysql; --",
+                        "user": "root",
+                    }
+                }
+            )
 
 
 class TokenManagerTests(unittest.TestCase):
@@ -314,11 +344,40 @@ class Pocket48ClientTests(unittest.TestCase):
         self.assertEqual(len(messages), 2)
 
 
+class MessageScraperTests(unittest.TestCase):
+    def test_run_once_raises_when_any_member_fails(self):
+        scraper = MessageScraper.__new__(MessageScraper)
+        scraper.config = {
+            "members": [
+                {
+                    "id": 1,
+                    "ownerName": "成员A",
+                    "serverId": 10,
+                    "channelId": 20,
+                },
+                {
+                    "id": 2,
+                    "ownerName": "成员B",
+                    "serverId": 11,
+                    "channelId": 21,
+                },
+            ],
+            "monitor": {"limit": 100},
+        }
+        scraper.client = mock.Mock()
+        scraper.client.login.return_value = True
+        scraper._run_member_once = mock.Mock(side_effect=[True, False])
+
+        with self.assertRaisesRegex(RuntimeError, "failed for 1 member"):
+            scraper.run_once(max_workers=1)
+
+
 class MessageParsingTests(unittest.TestCase):
     def test_member_role_detection_handles_nested_role_fields(self):
         self.assertTrue(parse_member_role_from_json({"user": {"roleId": 3}}))
         self.assertTrue(parse_member_role_from_json({"user": {"channelRole": "2"}}))
         self.assertFalse(parse_member_role_from_json({"user": {"roleId": 1}}))
+        self.assertFalse(parse_member_role_from_json({"user": {"roleId": 2}}))
 
     def test_sender_role_detection_distinguishes_member_and_fan_messages(self):
         member_message = make_message(

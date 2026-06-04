@@ -48,6 +48,9 @@
     "success_heartbeat_every": 12,
     "enabled": true
   },
+  "viewer": {
+    "cache_ttl_seconds": 30
+  },
   "notify": {
     "enabled": false,
     "provider": "serverchan",

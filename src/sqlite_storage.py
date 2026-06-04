@@ -3,6 +3,7 @@ import json
 import logging
 import sqlite3
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from message_parser import (
@@ -23,6 +24,8 @@ class SQLiteStorage(MessageStorage):
         self._init_database()
 
     def _connect(self):
+        if self.db_path != ":memory:":
+            Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         return sqlite3.connect(self.db_path)
 
     @contextmanager
@@ -492,6 +495,22 @@ class SQLiteStorage(MessageStorage):
         limit: Optional[int] = None,
         output_format: str = "json",
     ) -> int:
+        fieldnames = [
+            "room_id",
+            "message_id",
+            "user_id",
+            "username",
+            "member_name",
+            "sender_role",
+            "content",
+            "msg_type",
+            "ext_info",
+            "timestamp",
+            "created_at",
+        ]
+        if output_format not in {"json", "csv"}:
+            raise ValueError(f"不支持的导出格式: {output_format}")
+
         with self._get_conn() as conn:
             cursor = conn.cursor()
             query = "SELECT room_id, message_id, user_id, username, member_name, sender_role, content, msg_type, ext_info, timestamp, created_at FROM messages"
@@ -503,51 +522,54 @@ class SQLiteStorage(MessageStorage):
             if limit is not None:
                 query += " LIMIT ?"
                 params.append(limit)
-            rows = cursor.execute(query, params).fetchall()
-        messages = [
-            {
-                "room_id": row[0],
-                "message_id": row[1],
-                "user_id": row[2],
-                "username": row[3],
-                "member_name": row[4],
-                "sender_role": row[5],
-                "content": row[6],
-                "msg_type": row[7],
-                "ext_info": row[8],
-                "timestamp": row[9],
-                "created_at": row[10],
-            }
-            for row in rows
-        ]
-        if output_format == "json":
-            with open(output_path, "w", encoding="utf-8") as file:
-                json.dump(messages, file, ensure_ascii=False, indent=2)
-            return len(messages)
-        if output_format == "csv":
+            cursor.execute(query, params)
+
+            def row_to_dict(row):
+                return {
+                    "room_id": row[0],
+                    "message_id": row[1],
+                    "user_id": row[2],
+                    "username": row[3],
+                    "member_name": row[4],
+                    "sender_role": row[5],
+                    "content": row[6],
+                    "msg_type": row[7],
+                    "ext_info": row[8],
+                    "timestamp": row[9],
+                    "created_at": row[10],
+                }
+
+            count = 0
+            if output_format == "json":
+                with open(output_path, "w", encoding="utf-8") as file:
+                    file.write("[")
+                    first = True
+                    while True:
+                        rows = cursor.fetchmany(1000)
+                        if not rows:
+                            break
+                        for row in rows:
+                            if not first:
+                                file.write(",")
+                            file.write("\n")
+                            json.dump(row_to_dict(row), file, ensure_ascii=False)
+                            first = False
+                            count += 1
+                    if count:
+                        file.write("\n")
+                    file.write("]")
+                return count
+
             with open(output_path, "w", encoding="utf-8", newline="") as file:
-                writer = csv.DictWriter(
-                    file,
-                    fieldnames=list(messages[0].keys())
-                    if messages
-                    else [
-                        "room_id",
-                        "message_id",
-                        "user_id",
-                        "username",
-                        "member_name",
-                        "sender_role",
-                        "content",
-                        "msg_type",
-                        "ext_info",
-                        "timestamp",
-                        "created_at",
-                    ],
-                )
+                writer = csv.DictWriter(file, fieldnames=fieldnames)
                 writer.writeheader()
-                writer.writerows(messages)
-            return len(messages)
-        raise ValueError(f"不支持的导出格式: {output_format}")
+                while True:
+                    rows = cursor.fetchmany(1000)
+                    if not rows:
+                        break
+                    writer.writerows(row_to_dict(row) for row in rows)
+                    count += len(rows)
+                return count
 
     def record_fetch(
         self,

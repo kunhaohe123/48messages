@@ -158,7 +158,15 @@ pip install -r requirements.txt
 python -m unittest discover -s tests
 ```
 
-### 5. 填写关键配置
+### 5. 初始化或迁移数据库
+
+首次运行和每次部署新版本后，先显式执行数据库迁移。普通 scraper/viewer 启动只校验 schema，不再在服务启动时自动改表。
+
+```bash
+python src/pocket48_scraper.py -c config/config.json --migrate
+```
+
+### 6. 填写关键配置
 
 根据抓包结果，填充 `config/config.json` 中的以下关键字段：
 
@@ -167,7 +175,7 @@ python -m unittest discover -s tests
 3. `appInfo` - 请求头中的 `appInfo`
 成员的 `id` / `ownerName` / `channelId` / `serverId` 请填写到 `config/members.json`。
 
-### 6. 运行程序
+### 7. 运行程序
 
 `src/pocket48_scraper.py` 现在是统一入口，抓取、导出、统计都从这里执行。
 
@@ -238,7 +246,7 @@ python src/pocket48_scraper.py -c config/config.json --stats
 - 持续抓取使用按天滚动并保留最近 14 份历史日志；服务重启不会覆盖当天的 `scraper.log`
 - 单次抓取日志仍按单次执行覆盖写入，便于单独排查历史补抓和一次性任务
 
-### 6. 导出已抓取消息
+### 8. 导出已抓取消息
 
 导出为 JSON：
 
@@ -258,9 +266,10 @@ python src/pocket48_scraper.py -c config/config.json --export-format csv --outpu
 python src/pocket48_scraper.py -c config/config.json --export-format json --output data/latest.json --room-id 1312655 --limit 20
 ```
 
-### 7. 启动消息查看后台
+### 9. 启动消息查看后台
 
 项目已经提供一个轻量 Web 页面，用来查看数据库里已抓取的成员本人消息。
+首页房间列表和顶部统计默认缓存 30 秒，可在 `config/config.json` 的 `viewer.cache_ttl_seconds` 调整；设置为 `0` 可关闭缓存。
 
 ```bash
 python src/message_viewer.py -c config/config.json --host 127.0.0.1 --port 8000
@@ -277,7 +286,7 @@ python src/message_viewer.py -c config/config.json --host 127.0.0.1 --port 8000
 
 注意：这个页面直接读取当前配置对应的数据库，请自行做好访问控制，不要直接暴露到公网。
 
-### 8. 服务器部署与维护
+### 10. 服务器部署与维护
 
 当前推荐的线上部署结构：
 
@@ -344,7 +353,7 @@ HTTPS 说明：
 
 - 仓库已配置 GitHub Actions 工作流 `Deploy`
 - 当 `main` 分支收到新的 push 时，会自动通过 SSH 登录服务器并执行部署
-- 部署脚本会自动拉取最新代码、按需安装依赖、重启抓取和查看服务，并检查本机访问是否正常
+- 部署脚本会自动拉取最新代码、按需安装依赖、执行数据库迁移、重启抓取和查看服务，并检查本机访问是否正常
 - 如果只是普通代码改动、`requirements.txt` 没变，部署时会跳过 `pip install`
 - 如果需要手动部署，也可以在 GitHub 仓库的 `Actions -> Deploy` 页面点击 `Run workflow`
 

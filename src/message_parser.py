@@ -11,10 +11,14 @@ FAN_SENDER_ROLE = "fan"
 
 
 def _is_member_role_value(value: Any) -> bool:
-    if value == MEMBER_ROLE_ID:
-        return True
-    if str(value) == "2":
-        return True
+    return value == MEMBER_ROLE_ID
+
+
+def _is_member_role_field(key: str, value: Any) -> bool:
+    if key == "roleId":
+        return value == MEMBER_ROLE_ID
+    if key == "channelRole":
+        return value in MEMBER_CHANNEL_ROLES
     return False
 
 
@@ -25,7 +29,7 @@ def is_member_role_value(value: Any) -> bool:
 def _parse_member_role_from_json(data: Any) -> bool:
     if isinstance(data, dict):
         for key, value in data.items():
-            if key in MEMBER_ROLE_ID_KEYS and _is_member_role_value(value):
+            if key in MEMBER_ROLE_ID_KEYS and _is_member_role_field(key, value):
                 return True
             if _parse_member_role_from_json(value):
                 return True
@@ -100,8 +104,11 @@ def _sqlite_sender_role_case_expression(ext_info_column: str = "ext_info") -> st
     return (
         "CASE "
         f"WHEN {ext_info_column} LIKE '%\"roleId\": 3%' "
+        f"OR {ext_info_column} LIKE '%\"roleId\":3%' "
         f'OR {ext_info_column} LIKE \'%"channelRole": "2"%\' '
+        f'OR {ext_info_column} LIKE \'%"channelRole":"2"%\' '
         f"OR {ext_info_column} LIKE '%\"channelRole\": 2%' "
+        f"OR {ext_info_column} LIKE '%\"channelRole\":2%' "
         f"THEN '{MEMBER_SENDER_ROLE}' ELSE '{FAN_SENDER_ROLE}' END"
     )
 
@@ -113,11 +120,17 @@ def _mysql_sender_role_case_expression(
     return (
         "CASE "
         f"WHEN {raw_message_column} LIKE '%\\\"roleId\\\": 3%' "
+        f"OR {raw_message_column} LIKE '%\\\"roleId\\\":3%' "
         f'OR {raw_message_column} LIKE \'%\\"channelRole\\": \\"2\\"%\' '
+        f'OR {raw_message_column} LIKE \'%\\"channelRole\\":\\"2\\"%\' '
         f"OR {raw_message_column} LIKE '%\\\"channelRole\\\": 2%' "
+        f"OR {raw_message_column} LIKE '%\\\"channelRole\\\":2%' "
         f"OR {ext_info_column} LIKE '%\\\"roleId\\\": 3%' "
+        f"OR {ext_info_column} LIKE '%\\\"roleId\\\":3%' "
         f'OR {ext_info_column} LIKE \'%\\"channelRole\\": \\"2\\"%\' '
+        f'OR {ext_info_column} LIKE \'%\\"channelRole\\":\\"2\\"%\' '
         f"OR {ext_info_column} LIKE '%\\\"channelRole\\\": 2%' "
+        f"OR {ext_info_column} LIKE '%\\\"channelRole\\\":2%' "
         f"THEN '{MEMBER_SENDER_ROLE}' ELSE '{FAN_SENDER_ROLE}' END"
     )
 
@@ -252,4 +265,3 @@ def _timestamp_ms_to_datetime(value: Any) -> datetime:
 
 def timestamp_ms_to_datetime(value: Any) -> datetime:
     return _timestamp_ms_to_datetime(value)
-

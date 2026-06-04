@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+import re
 from typing import Any, Dict, List, Optional
 
 
@@ -157,8 +158,11 @@ class StorageConfigError(StorageError, ValueError):
 def _validate_storage_config(storage_config: Dict[str, Any], storage_type: str) -> None:
     errors: List[str] = []
     if storage_type == "mysql":
-        if not storage_config.get("database"):
+        database = storage_config.get("database")
+        if not database:
             errors.append("database (MySQL database name) is required")
+        elif not re.fullmatch(r"[A-Za-z0-9_]+", str(database)):
+            errors.append("database must contain only letters, numbers, and underscores")
         if not storage_config.get("user"):
             errors.append("user (MySQL user) is required")
         if not storage_config.get("host"):
@@ -167,11 +171,15 @@ def _validate_storage_config(storage_config: Dict[str, Any], storage_type: str) 
         raise StorageConfigError(f"Invalid storage config: {', '.join(errors)}")
 
 
-def create_storage(config: Dict[str, Any]) -> MessageStorage:
+def create_storage(
+    config: Dict[str, Any], initialize_schema: Optional[bool] = None
+) -> MessageStorage:
     """按配置选择具体存储实现。"""
     storage_config = config.get("storage", {})
     storage_type = storage_config.get("type", "mysql")
     _validate_storage_config(storage_config, storage_type)
+    if initialize_schema is None:
+        initialize_schema = bool(storage_config.get("auto_migrate_on_startup", True))
     if storage_type == "sqlite":
         from sqlite_storage import SQLiteStorage
 
@@ -187,5 +195,6 @@ def create_storage(config: Dict[str, Any]) -> MessageStorage:
             password=storage_config.get("password", ""),
             charset=storage_config.get("charset", "utf8mb4"),
             pool_size=storage_config.get("pool_size", 10),
+            initialize_schema=initialize_schema,
         )
     raise ValueError(f"不支持的存储类型: {storage_type}")

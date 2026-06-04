@@ -1,5 +1,7 @@
 import argparse
 import json
+import threading
+import time
 from datetime import datetime, timedelta
 from math import ceil
 from pathlib import Path
@@ -53,7 +55,7 @@ def parse_datetime_local(value: str, is_end: bool = False) -> Optional[int]:
 
 def create_app(config_path: str) -> Flask:
     config = load_config(config_path)
-    storage = create_storage(config)
+    storage = create_storage(config, initialize_schema=False)
     app = Flask(
         __name__,
         template_folder=str(BASE_DIR / "templates"),
@@ -62,6 +64,31 @@ def create_app(config_path: str) -> Flask:
     app.wsgi_app = ProxyFix(app.wsgi_app, x_prefix=1)
     app.jinja_env.filters["timestamp"] = format_timestamp
     app.jinja_env.filters["pretty_json"] = pretty_json
+    viewer_config = config.get("viewer", {})
+    try:
+        cache_ttl_seconds = max(float(viewer_config.get("cache_ttl_seconds", 30)), 0.0)
+    except (TypeError, ValueError):
+        cache_ttl_seconds = 30.0
+    cache_lock = threading.Lock()
+    cache: Dict[str, Dict[str, Any]] = {}
+
+    def cached_value(key: str, factory):
+        if cache_ttl_seconds <= 0:
+            return factory()
+
+        now = time.time()
+        with cache_lock:
+            entry = cache.get(key)
+            if entry and now < entry["expires_at"]:
+                return entry["value"]
+
+        value = factory()
+        with cache_lock:
+            cache[key] = {
+                "value": value,
+                "expires_at": now + cache_ttl_seconds,
+            }
+        return value
 
     def build_summary_stats() -> Dict[str, Any]:
         today_start = int(
@@ -70,7 +97,10 @@ def create_app(config_path: str) -> Flask:
             .timestamp()
             * 1000
         )
-        return storage.get_viewer_summary(today_start)
+        return cached_value(
+            f"summary:{today_start}",
+            lambda: storage.get_viewer_summary(today_start),
+        )
 
     @app.route("/stats-summary")
     def stats_summary() -> Any:
@@ -91,7 +121,7 @@ def create_app(config_path: str) -> Flask:
         end_time_ms = parse_datetime_local(end_time, is_end=True) if end_time else None
         offset = (page - 1) * page_size
 
-        rooms = storage.list_rooms()
+        rooms = cached_value("rooms", storage.list_rooms)
         summary_stats = build_summary_stats()
 
         search_kwargs = {

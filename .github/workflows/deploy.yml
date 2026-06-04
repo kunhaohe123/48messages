@@ -28,6 +28,14 @@ jobs:
           script: |
             set -e
             cd /opt/48messages
+            SCRAPER_STOPPED=0
+
+            restore_scraper() {
+              if [ "$SCRAPER_STOPPED" = "1" ]; then
+                systemctl start 48messages-scraper || true
+              fi
+            }
+            trap restore_scraper EXIT
 
             get_viewer_total_messages() {
               for _ in 1 2 3 4 5; do
@@ -49,11 +57,13 @@ jobs:
             fi
 
             # 在影响生产服务前先做基础检查；失败时保留当前运行中的服务。
-            /opt/48messages-venv/bin/python -m py_compile src/pocket48_scraper.py src/message_storage.py src/message_viewer.py tests/test_core.py
+            /opt/48messages-venv/bin/python -m py_compile src/*.py tests/test_core.py
             /opt/48messages-venv/bin/python -m unittest discover -s tests
 
-            # 先停掉抓取服务，避免校验 viewer 时数据库仍在继续写入。
+            # 先停掉抓取服务，避免迁移/校验 viewer 时数据库仍在继续写入。
             systemctl stop 48messages-scraper
+            SCRAPER_STOPPED=1
+            PYTHONPATH=src /opt/48messages-venv/bin/python src/pocket48_scraper.py -c config/config.json --migrate
             systemctl restart 48messages-viewer
             systemctl is-active 48messages-viewer
 
@@ -82,4 +92,6 @@ jobs:
 
             # viewer 校验通过后再启动抓取服务，避免部署期间漏抓太久。
             systemctl start 48messages-scraper
+            SCRAPER_STOPPED=0
+            trap - EXIT
             systemctl is-active 48messages-scraper

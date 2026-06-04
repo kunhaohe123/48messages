@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import pymysql
-from pymysql.cursors import DictCursor
+from pymysql.cursors import DictCursor, SSDictCursor
 
 from message_parser import (
     FAN_SENDER_ROLE,
@@ -21,7 +21,7 @@ from message_parser import (
     parse_json_like,
     timestamp_ms_to_datetime,
 )
-from message_storage import MessageStorage
+from message_storage import MessageStorage, StorageConfigError
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,7 @@ class MySQLStorage(MessageStorage):
         password: str,
         charset: str = "utf8mb4",
         pool_size: int = 10,
+        initialize_schema: bool = True,
     ):
         self.connection_args = {
             "host": host,
@@ -59,8 +60,11 @@ class MySQLStorage(MessageStorage):
         self._pool_size = pool_size
         self._pool: List[pymysql.connections.Connection] = []
         self._pool_lock = threading.Lock()
-        self._ensure_database()
-        self._init_database()
+        if initialize_schema:
+            self._ensure_database()
+            self._init_database()
+        else:
+            self._validate_database_schema()
 
     def _get_pool_lock(self):
         return self._pool_lock
@@ -305,11 +309,42 @@ class MySQLStorage(MessageStorage):
                     """
                 )
                 self._ensure_messages_sender_role_schema(cursor)
+                self._ensure_viewer_query_indexes(cursor)
                 self._run_mysql_migrations(cursor)
             conn.commit()
         except Exception:
             conn.rollback()
             raise
+        finally:
+            conn.close()
+
+    def _validate_database_schema(self) -> None:
+        required_tables = {
+            "members",
+            "messages",
+            "message_payloads",
+            "crawl_tasks",
+            "crawl_checkpoints",
+            "crawl_history_checkpoints",
+            "schema_migrations",
+        }
+        try:
+            conn = self._connect()
+        except pymysql.MySQLError as exc:
+            raise StorageConfigError(
+                "MySQL schema is not initialized; run "
+                "`python src/pocket48_scraper.py -c config/config.json --migrate` first"
+            ) from exc
+
+        try:
+            with conn.cursor() as cursor:
+                for table_name in sorted(required_tables):
+                    cursor.execute("SHOW TABLES LIKE %s", (table_name,))
+                    if cursor.fetchone() is None:
+                        raise StorageConfigError(
+                            f"MySQL schema missing table `{table_name}`; run "
+                            "`python src/pocket48_scraper.py -c config/config.json --migrate` first"
+                        )
         finally:
             conn.close()
 
@@ -367,6 +402,21 @@ class MySQLStorage(MessageStorage):
             "idx_messages_room_role_time": "CREATE INDEX idx_messages_room_role_time ON messages (room_id, sender_role, message_time_ms)",
             "idx_messages_server_role_time": "CREATE INDEX idx_messages_server_role_time ON messages (server_id, sender_role, message_time_ms)",
             "idx_messages_sender_role_time": "CREATE INDEX idx_messages_sender_role_time ON messages (sender_role, message_time_ms)",
+        }
+        for index_name, statement in index_definitions.items():
+            if not self._mysql_index_exists(cursor, "messages", index_name):
+                cursor.execute(statement)
+
+    def _ensure_viewer_query_indexes(self, cursor) -> None:
+        index_definitions = {
+            "idx_messages_role_type_time": (
+                "CREATE INDEX idx_messages_role_type_time "
+                "ON messages (sender_role, message_type, message_time_ms, room_id)"
+            ),
+            "idx_messages_room_role_type_time": (
+                "CREATE INDEX idx_messages_room_role_type_time "
+                "ON messages (room_id, sender_role, message_type, message_time_ms)"
+            ),
         }
         for index_name, statement in index_definitions.items():
             if not self._mysql_index_exists(cursor, "messages", index_name):
@@ -1042,9 +1092,25 @@ class MySQLStorage(MessageStorage):
         limit: Optional[int] = None,
         output_format: str = "json",
     ) -> int:
+        fieldnames = [
+            "room_id",
+            "message_id",
+            "user_id",
+            "username",
+            "member_name",
+            "sender_role",
+            "content",
+            "msg_type",
+            "ext_info",
+            "timestamp",
+            "created_at",
+        ]
+        if output_format not in {"json", "csv"}:
+            raise ValueError(f"不支持的导出格式: {output_format}")
+
         with self._get_conn() as conn:
             try:
-                with conn.cursor() as cursor:
+                with conn.cursor(SSDictCursor) as cursor:
                     query = """
                         SELECT
                             m.room_id,
@@ -1070,39 +1136,46 @@ class MySQLStorage(MessageStorage):
                         query += " LIMIT %s"
                         params.append(limit)
                     cursor.execute(query, params)
-                    messages = list(cursor.fetchall())
+
+                    count = 0
+                    if output_format == "json":
+                        with open(output_path, "w", encoding="utf-8") as file:
+                            file.write("[")
+                            first = True
+                            while True:
+                                rows = cursor.fetchmany(1000)
+                                if not rows:
+                                    break
+                                for row in rows:
+                                    if not first:
+                                        file.write(",")
+                                    file.write("\n")
+                                    json.dump(
+                                        row,
+                                        file,
+                                        ensure_ascii=False,
+                                        default=str,
+                                    )
+                                    first = False
+                                    count += 1
+                            if count:
+                                file.write("\n")
+                            file.write("]")
+                        return count
+
+                    with open(output_path, "w", encoding="utf-8", newline="") as file:
+                        writer = csv.DictWriter(file, fieldnames=fieldnames)
+                        writer.writeheader()
+                        while True:
+                            rows = cursor.fetchmany(1000)
+                            if not rows:
+                                break
+                            writer.writerows(rows)
+                            count += len(rows)
+                    return count
             except Exception:
                 logger.error("导出消息失败 room_id=%s", room_id, exc_info=True)
                 raise
-
-        if output_format == "json":
-            with open(output_path, "w", encoding="utf-8") as file:
-                json.dump(messages, file, ensure_ascii=False, indent=2, default=str)
-            return len(messages)
-        if output_format == "csv":
-            fieldnames = (
-                list(messages[0].keys())
-                if messages
-                else [
-                    "room_id",
-                    "message_id",
-                    "user_id",
-                    "username",
-                    "member_name",
-                    "sender_role",
-                    "content",
-                    "msg_type",
-                    "ext_info",
-                    "timestamp",
-                    "created_at",
-                ]
-            )
-            with open(output_path, "w", encoding="utf-8", newline="") as file:
-                writer = csv.DictWriter(file, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(messages)
-            return len(messages)
-        raise ValueError(f"不支持的导出格式: {output_format}")
 
     def record_fetch(
         self,
@@ -1321,11 +1394,21 @@ class MySQLStorage(MessageStorage):
                     where_sql = (
                         f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
                     )
-                    count_query = (
-                        "SELECT COUNT(*) AS cnt FROM messages m "
-                        "LEFT JOIN message_payloads mp ON mp.message_id = m.message_id "
-                        "LEFT JOIN members mem ON mem.server_id = m.server_id"
-                        f"{where_sql}"
+                    count_joins = []
+                    if keyword:
+                        count_joins.append(
+                            "LEFT JOIN message_payloads mp ON mp.message_id = m.message_id"
+                        )
+                    if sender_keyword:
+                        count_joins.append(
+                            "LEFT JOIN members mem ON mem.server_id = m.server_id"
+                        )
+                    count_query = " ".join(
+                        [
+                            "SELECT COUNT(*) AS cnt FROM messages m",
+                            *count_joins,
+                            where_sql,
+                        ]
                     )
                     cursor.execute(count_query, params)
                     total = cursor.fetchone()["cnt"]
