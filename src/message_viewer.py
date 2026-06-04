@@ -70,32 +70,7 @@ def create_app(config_path: str) -> Flask:
             .timestamp()
             * 1000
         )
-        text_stats = storage.search_messages(
-            sender_role="member",
-            msg_type="TEXT",
-            limit=0,
-            offset=0,
-        )
-        rooms = storage.list_rooms()
-        today_stats = storage.search_messages(
-            sender_role="member",
-            msg_type="TEXT",
-            start_time_ms=today_start,
-            limit=0,
-            offset=0,
-        )
-        top_member_today = storage.get_top_member_for_day(today_start)
-        return {
-            "total_messages": text_stats["total"],
-            "total_rooms": len(rooms),
-            "today_messages": today_stats["total"],
-            "top_member_name": top_member_today.get("member_name")
-            if top_member_today
-            else "-",
-            "top_member_count": top_member_today.get("message_count")
-            if top_member_today
-            else 0,
-        }
+        return storage.get_viewer_summary(today_start)
 
     @app.route("/stats-summary")
     def stats_summary() -> Any:

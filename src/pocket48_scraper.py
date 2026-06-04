@@ -19,12 +19,9 @@ from pathlib import Path
 
 import requests
 
-from message_storage import (
-    MessageStorage,
-    create_storage,
-    _parse_json_like,
-    _parse_member_role_from_json,
-)
+from message_normalizer import normalize_room_messages
+from message_parser import parse_json_like, parse_member_role_from_json
+from message_storage import MessageStorage, create_storage
 
 log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "logs")
 os.makedirs(log_dir, exist_ok=True)
@@ -217,11 +214,15 @@ class ServerChanNotifier:
             logger.error("ServerChan recovery failed %s: %s", event_key, exc)
 
 
-class AuthenticationUnavailableError(RuntimeError):
+class Pocket48ScraperError(RuntimeError):
+    """抓取器运行时错误基类。"""
+
+
+class AuthenticationUnavailableError(Pocket48ScraperError):
     """当前没有可用认证信息，但服务应继续等待人工恢复。"""
 
 
-class FetchMessagesError(RuntimeError):
+class FetchMessagesError(Pocket48ScraperError):
     """房间消息接口请求失败。"""
 
 
@@ -230,6 +231,7 @@ class TokenManager:
 
     def __init__(self, token_file: str = DEFAULT_TOKEN_PATH):
         self.token_file = resolve_project_path(token_file)
+        self._lock = threading.RLock()
         self.token_data = self._load_token()
 
     def _load_token(self) -> Dict[str, Any]:
@@ -266,63 +268,70 @@ class TokenManager:
             logger.warning("Failed to chmod token file: %s", exc)
 
     def reload(self):
-        self.token_data = self._load_token()
+        with self._lock:
+            self.token_data = self._load_token()
 
     def set_token(self, access_token: str, expires_in: int = DEFAULT_TOKEN_TTL_SECONDS):
-        now = time.time()
-        self.token_data = {
-            "access_token": access_token,
-            "expires_at": now + expires_in,
-            "acquired_at": now,
-        }
-        self._save_token()
+        with self._lock:
+            now = time.time()
+            self.token_data = {
+                "access_token": access_token,
+                "expires_at": now + expires_in,
+                "acquired_at": now,
+            }
+            self._save_token()
         logger.info("Token saved")
 
     def has_token(self) -> bool:
-        return bool(self.token_data.get("access_token"))
+        with self._lock:
+            return bool(self.token_data.get("access_token"))
 
     def is_expired(self) -> bool:
-        if not self.has_token():
-            return True
-        return time.time() >= self.token_data.get("expires_at", 0)
+        with self._lock:
+            if not self.has_token():
+                return True
+            return time.time() >= self.token_data.get("expires_at", 0)
 
     def get_token(self, allow_expired: bool = False) -> Optional[str]:
-        if not self.token_data:
-            return None
-        if not allow_expired and self.is_expired():
-            logger.warning("Token expired")
-            return None
-        return self.token_data.get("access_token")
+        with self._lock:
+            if not self.token_data:
+                return None
+            if not allow_expired and self.is_expired():
+                logger.warning("Token expired")
+                return None
+            return self.token_data.get("access_token")
 
     def refresh_expiry(
         self,
         expires_in: int = DEFAULT_TOKEN_REFRESH_TTL_SECONDS,
         log_refresh: bool = True,
     ) -> bool:
-        if not self.has_token():
-            return False
-        now = time.time()
-        old_expires_at = self.token_data.get("expires_at", 0)
-        remaining_seconds = max(old_expires_at - now, 0)
-        refresh_when_below = max(int(expires_in // 3), 600)
-        if remaining_seconds > refresh_when_below:
-            return False
+        with self._lock:
+            if not self.has_token():
+                return False
+            now = time.time()
+            old_expires_at = self.token_data.get("expires_at", 0)
+            remaining_seconds = max(old_expires_at - now, 0)
+            refresh_when_below = max(int(expires_in // 3), 600)
+            if remaining_seconds > refresh_when_below:
+                return False
 
-        new_expires_at = now + expires_in
-        old_expires_at = self.token_data.get("expires_at", 0)
-        if new_expires_at <= old_expires_at:
-            return False
-        self.token_data["expires_at"] = new_expires_at
-        self._save_token()
+            new_expires_at = now + expires_in
+            old_expires_at = self.token_data.get("expires_at", 0)
+            if new_expires_at <= old_expires_at:
+                return False
+            self.token_data["expires_at"] = new_expires_at
+            self._save_token()
         if log_refresh:
             logger.info("Token expiry refreshed")
         return True
 
     def clear(self):
-        self.token_data = {}
-        path = self.token_file
-        if path.exists():
-            path.unlink()
+        with self._lock:
+            self.token_data = {}
+            path = self.token_file
+            if path.exists():
+                path.unlink()
         logger.info("Token cleared")
 
 
@@ -510,14 +519,14 @@ class Pocket48Client:
     def _extract_user_from_ext(self, ext_info: Any) -> Dict[str, Any]:
         if not ext_info:
             return {}
-        parsed = _parse_json_like(ext_info)
+        parsed = parse_json_like(ext_info)
         return parsed.get("user", {}) if isinstance(parsed, dict) else {}
 
     def _is_member_message(self, ext_info: Any) -> bool:
         if not ext_info:
             return False
-        parsed = _parse_json_like(ext_info)
-        return _parse_member_role_from_json(parsed)
+        parsed = parse_json_like(ext_info)
+        return parse_member_role_from_json(parsed)
 
     def login(self) -> bool:
         if self.token_manager.get_token():
@@ -663,56 +672,22 @@ class Pocket48Client:
 
             content = data.get("content", {})
             messages = content.get("message", [])
-            normalized_messages = []
-            room_id = str(channel_id)
-            oldest_raw_timestamp = None
-            newest_raw_timestamp = None
-            # 统一整理成存储层可直接消费的结构，避免数据库实现感知接口细节。
-            for msg in messages:
-                message_timestamp = msg.get("msgTime")
-                if message_timestamp is not None:
-                    if (
-                        newest_raw_timestamp is None
-                        or message_timestamp > newest_raw_timestamp
-                    ):
-                        newest_raw_timestamp = message_timestamp
-                    if (
-                        oldest_raw_timestamp is None
-                        or message_timestamp < oldest_raw_timestamp
-                    ):
-                        oldest_raw_timestamp = message_timestamp
-                ext_info = msg.get("extInfo", "")
-                parsed_ext_info = _parse_json_like(ext_info)
-                if not self._is_member_message(parsed_ext_info):
-                    continue
-                if str(msg.get("msgType") or "") != "TEXT":
-                    continue
-                user_info = self._extract_user_from_ext(parsed_ext_info)
-                normalized_messages.append(
-                    {
-                        "room_id": room_id,
-                        "server_id": server_id,
-                        "channel_id": channel_id,
-                        "owner_member_id": server_id,
-                        "member_name": _member_display_name(member),
-                        "message_id": msg.get("msgIdServer") or msg.get("msgIdClient"),
-                        "user_id": user_info.get("userId"),
-                        "username": user_info.get("nickName"),
-                        "content": msg.get("bodys"),
-                        "msg_type": msg.get("msgType"),
-                        "ext_info": ext_info,
-                        "timestamp": msg.get("msgTime"),
-                    }
-                )
+            normalized = normalize_room_messages(
+                raw_messages=messages,
+                server_id=server_id,
+                channel_id=channel_id,
+                member_name=_member_display_name(member),
+            )
+            normalized_messages = normalized["messages"]
 
             self._mark_token_accepted()
             logger.debug("Fetched %s member TEXT messages", len(normalized_messages))
             return {
                 "messages": normalized_messages,
                 "next_time": content.get("nextTime", next_time),
-                "raw_count": len(messages),
-                "newest_raw_timestamp": newest_raw_timestamp,
-                "oldest_raw_timestamp": oldest_raw_timestamp,
+                "raw_count": normalized["raw_count"],
+                "newest_raw_timestamp": normalized["newest_raw_timestamp"],
+                "oldest_raw_timestamp": normalized["oldest_raw_timestamp"],
             }
 
         except requests.HTTPError as exc:
@@ -734,6 +709,8 @@ class Pocket48Client:
                     or f"saved token rejected by server with HTTP {exc.response.status_code}"
                 ) from exc
             raise FetchMessagesError(f"Fetch message HTTP error: {exc}") from exc
+        except AuthenticationUnavailableError:
+            raise
         except requests.RequestException as exc:
             raise FetchMessagesError(f"Fetch message request error: {exc}") from exc
         except Exception as exc:
