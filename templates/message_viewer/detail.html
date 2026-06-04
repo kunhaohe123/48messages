@@ -1,0 +1,50 @@
+{% extends "message_viewer/layout.html" %}
+
+{% block content %}
+<div class="header">
+  <div>
+    <h1>消息详情</h1>
+    <div class="mono">{{ message_id }}</div>
+  </div>
+  <div class="toolbar"><a href="{{ url_for('index') }}">返回列表</a></div>
+</div>
+
+<div class="grid">
+  <div class="kv">
+    <div class="key">房间</div>
+    <div>{{ message.get("room_name") or message.get("room_id") or "-" }}</div>
+  </div>
+  <div class="kv">
+    <div class="key">发送人</div>
+    <div>{{ message.get("username") or "-" }}</div>
+    <div class="mono">{{ message.get("user_id") or "-" }}</div>
+  </div>
+  <div class="kv">
+    <div class="key">身份</div>
+    <div>成员本人</div>
+  </div>
+  <div class="kv">
+    <div class="key">消息类型</div>
+    <div>{{ message.get("msg_type") or "-" }}</div>
+  </div>
+  <div class="kv">
+    <div class="key">消息时间</div>
+    <div>{{ message.get("timestamp")|timestamp }}</div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>文本内容</h2>
+  <pre>{{ message.get("content") or "-" }}</pre>
+</div>
+
+<div class="panel">
+  <h2>扩展字段</h2>
+  <pre>{{ message.get("ext_info")|pretty_json }}</pre>
+</div>
+
+<div class="panel">
+  <h2>原始摘要</h2>
+  <pre>{{ message.get("raw_brief")|pretty_json }}</pre>
+</div>
+{% endblock %}

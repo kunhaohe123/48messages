@@ -1,0 +1,134 @@
+{% extends "message_viewer/layout.html" %}
+
+{% macro pager(extra_class="") -%}
+<div class="panel pager {{ extra_class }}">
+  <span class="pager-info">第 {{ page }} / {{ total_pages }} 页，共 {{ total }} 条</span>
+  <div class="pager-actions">
+    <a href="{{ build_index_url(1) }}">首页</a>
+    <a href="{{ build_index_url([page - 1, 1]|max) }}">上一页</a>
+    <a href="{{ build_index_url([page + 1, total_pages]|min) }}">下一页</a>
+  </div>
+  <form method="get" class="pager-jump">
+    {% for key, value in filters.items() %}
+      {% if value %}
+        <input type="hidden" name="{{ key }}" value="{{ value }}">
+      {% endif %}
+    {% endfor %}
+    <label>跳至<input type="number" name="page" min="1" max="{{ total_pages }}" value="{{ page }}"></label>
+    <button type="submit">跳转</button>
+  </form>
+</div>
+{%- endmacro %}
+
+{% block content %}
+<div class="header">
+  <div>
+    <h1>口袋房间消息查看</h1>
+  </div>
+  <div class="toolbar"><a href="{{ url_for('index') }}">刷新</a></div>
+</div>
+
+<div class="panel stats">
+  <div class="stat">
+    <div class="stat-icon">💬</div>
+    <div class="stat-content">
+      <div class="stat-value">{{ summary_stats.total_messages }}</div>
+      <div class="stat-label">总消息数</div>
+    </div>
+  </div>
+  <div class="stat">
+    <div class="stat-icon">🏠</div>
+    <div class="stat-content">
+      <div class="stat-value">{{ rooms|length }}</div>
+      <div class="stat-label">房间数</div>
+    </div>
+  </div>
+  <div class="stat">
+    <div class="stat-icon">📅</div>
+    <div class="stat-content">
+      <div class="stat-value">{{ summary_stats.today_messages }}</div>
+      <div class="stat-label">今日消息数</div>
+    </div>
+  </div>
+  <div class="stat">
+    <div class="stat-icon">⏰</div>
+    <div class="stat-content">
+      <div class="stat-value">{{ summary_stats.top_member_count }}</div>
+      <div class="stat-label">今日话痨：{{ summary_stats.top_member_name }}</div>
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <form method="get" class="filter-form">
+    <div>
+      <label for="room_id">房间</label>
+      <select id="room_id" name="room_id">
+        <option value="">全部房间</option>
+        {% for room in rooms %}
+          {% set room_id = room.get("id") ~ "" %}
+          {% set label = (room.get("name") or room.get("id")) ~ " (" ~ room.get("message_count", 0) ~ ")" %}
+          <option value="{{ room_id }}" {% if room_id == filters.room_id %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <label for="sender">名字模糊搜</label>
+      <input id="sender" name="sender" value="{{ filters.sender }}" placeholder="成员名或发送昵称">
+    </div>
+    <div>
+      <label for="keyword">关键词</label>
+      <input id="keyword" name="keyword" value="{{ filters.keyword }}" placeholder="消息内容、回复、附加字段">
+    </div>
+    <div>
+      <label for="start_time">开始时间</label>
+      <div class="date-input-wrap">
+        <input id="start_time" name="start_time" type="date" value="{{ filters.start_time }}" data-clearable-date>
+      </div>
+    </div>
+    <div>
+      <label for="end_time">结束时间</label>
+      <div class="date-input-wrap">
+        <input id="end_time" name="end_time" type="date" value="{{ filters.end_time }}" data-clearable-date>
+      </div>
+    </div>
+    <div>
+      <label for="page_size">每页条数</label>
+      <input id="page_size" name="page_size" type="number" min="10" max="200" value="{{ page_size }}">
+    </div>
+    <div class="filter-actions">
+      <button type="submit">查询</button>
+      <a class="button-link button-secondary" href="{{ url_for('index') }}">清空</a>
+    </div>
+  </form>
+</div>
+
+{{ pager("pager-top") }}
+
+<div class="panel">
+  <table>
+    <thead>
+      <tr>
+        <th>房间</th>
+        <th>内容摘要</th>
+        <th>时间</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in items %}
+        {% set content = item.get("content") or item.get("flip_answer") or item.get("reply_to_text") or "-" %}
+        {% set room_name = item.get("room_name") or item.get("room_id") %}
+        <tr>
+          <td data-label="房间" class="cell-room">{{ room_name }}</td>
+          <td data-label="内容" title="{{ content }}"><div class="content">{{ content }}</div></td>
+          <td data-label="时间" class="cell-time">{{ item.get("timestamp")|timestamp }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="3">没有匹配到消息</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{{ pager() }}
+{% endblock %}
