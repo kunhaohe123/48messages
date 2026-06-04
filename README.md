@@ -8,7 +8,9 @@
 48messages/
 ├── config/
 │   ├── config.example.json  # 配置文件模板
-│   └── config.json          # 本地配置（忽略提交）
+│   ├── config.json          # 本地认证与数据库配置（忽略提交）
+│   ├── members.example.json # 成员列表模板
+│   └── members.json         # 成员列表（可提交跟踪）
 ├── data/
 │   ├── runtime/
 │   │   └── token.json       # 本地 token 缓存（忽略提交）
@@ -80,7 +82,7 @@ cp config/members.example.json config/members.json
 }
 ```
 
-编辑 `config/members.json`，单独维护成员列表：
+编辑 `config/members.json`，单独维护成员列表。该文件可以被 Git 跟踪，用于随项目版本化和部署成员资料；不要在其中放入 token、抓包请求头、密码等敏感信息。
 
 ```json
 [
@@ -148,7 +150,15 @@ cp config/members.example.json config/members.json
 pip install -r requirements.txt
 ```
 
-### 4. 填写关键配置
+### 4. 运行基础测试
+
+基础测试不需要真实账号、抓包 token 或 MySQL，会使用临时 SQLite 数据库验证配置加载、成员消息识别、消息去重/搜索、历史断点和 Web 查看器基本页面。
+
+```bash
+python -m unittest discover -s tests
+```
+
+### 5. 填写关键配置
 
 根据抓包结果，填充 `config/config.json` 中的以下关键字段：
 
@@ -157,7 +167,7 @@ pip install -r requirements.txt
 3. `appInfo` - 请求头中的 `appInfo`
 成员的 `id` / `ownerName` / `channelId` / `serverId` 请填写到 `config/members.json`。
 
-### 5. 运行程序
+### 6. 运行程序
 
 `src/pocket48_scraper.py` 现在是统一入口，抓取、导出、统计都从这里执行。
 

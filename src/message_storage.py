@@ -219,6 +219,10 @@ class MessageStorage(ABC):
     """统一存储接口，抓取层只依赖这些能力，不关心底层是 SQLite 还是 MySQL。"""
 
     @abstractmethod
+    def sync_members(self, members: List[Dict[str, Any]]) -> int:
+        pass
+
+    @abstractmethod
     def save_message(self, message: Dict[str, Any]) -> bool:
         pass
 
@@ -358,6 +362,27 @@ class SQLiteStorage(MessageStorage):
 
     def _connect(self):
         return sqlite3.connect(self.db_path)
+
+    def sync_members(self, members: List[Dict[str, Any]]) -> int:
+        synced_count = 0
+        for member in members:
+            if not isinstance(member, dict):
+                continue
+            if (
+                member.get("memberId") is None
+                and member.get("id") is None
+            ):
+                continue
+            if member.get("serverId") is None or member.get("channelId") is None:
+                continue
+            if not (
+                member.get("ownerName")
+                or member.get("memberName")
+                or member.get("nickname")
+            ):
+                continue
+            synced_count += 1
+        return synced_count
 
     def _init_database(self):
         # SQLite 版本只保留最小表结构，适合本地试跑和调试。

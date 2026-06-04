@@ -48,6 +48,10 @@ jobs:
               /opt/48messages-venv/bin/pip install -r requirements.txt
             fi
 
+            # 在影响生产服务前先做基础检查；失败时保留当前运行中的服务。
+            /opt/48messages-venv/bin/python -m py_compile src/pocket48_scraper.py src/message_storage.py src/message_viewer.py tests/test_core.py
+            /opt/48messages-venv/bin/python -m unittest discover -s tests
+
             # 先停掉抓取服务，避免校验 viewer 时数据库仍在继续写入。
             systemctl stop 48messages-scraper
             systemctl restart 48messages-viewer

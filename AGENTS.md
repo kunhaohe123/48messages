@@ -24,7 +24,12 @@ pip install -r requirements.txt
 ```bash
 cp config/config.example.json config/config.json
 cp config/members.example.json config/members.json
-# Edit both files with your credentials and member list
+# Edit config.json with credentials/captured headers, and members.json with the tracked member list
+```
+
+### Run Tests
+```bash
+python -m unittest discover -s tests
 ```
 
 ### Run Scrapers
@@ -76,7 +81,7 @@ python src/message_viewer.py -c config/config.json --host 127.0.0.1 --port 8000
 │   ├── config.example.json   # Configuration template
 │   ├── config.json           # Local config (git-ignored)
 │   ├── members.example.json  # Member list template
-│   └── members.json          # Local member data (git-ignored)
+│   └── members.json          # Tracked member list used by scraper/viewer
 ├── data/
 │   ├── runtime/              # Token cache (git-ignored)
 │   └── logs/                 # Application logs (git-ignored)
@@ -177,7 +182,8 @@ This tool **cannot work without packet capture**:
 4. Re-capture when token expires (usually after several hours)
 
 ### File Handling
-- **Never commit**: `config/config.json`, `config/members.json`, `data/runtime/token.json`
+- **Never commit**: `config/config.json`, `data/runtime/token.json`
+- `config/members.json` is intentionally tracked so member metadata can be versioned and deployed with the project. Do not place auth tokens, captured headers, passwords, or other secrets in it.
 - **Log rotation**: 14 days retention in `data/logs/`
 - **Export files**: Written to `data/` directory
 

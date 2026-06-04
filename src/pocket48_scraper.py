@@ -236,13 +236,34 @@ class TokenManager:
         path = self.token_file
         if not path.exists():
             return {}
-        with open(path, "r", encoding="utf-8") as file:
-            return json.load(file)
+        try:
+            with open(path, "r", encoding="utf-8") as file:
+                token_data = json.load(file)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Token cache ignored: %s", exc)
+            return {}
+        if not isinstance(token_data, dict):
+            logger.warning(
+                "Token cache ignored: expected object, got %s",
+                type(token_data).__name__,
+            )
+            return {}
+        return token_data
 
     def _save_token(self):
         self.token_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.token_file, "w", encoding="utf-8") as file:
+        temp_file = self.token_file.with_name(f".{self.token_file.name}.tmp")
+        with open(temp_file, "w", encoding="utf-8") as file:
             json.dump(self.token_data, file, ensure_ascii=False, indent=2)
+        try:
+            os.chmod(temp_file, 0o600)
+        except OSError as exc:
+            logger.warning("Failed to chmod token temp file: %s", exc)
+        os.replace(temp_file, self.token_file)
+        try:
+            os.chmod(self.token_file, 0o600)
+        except OSError as exc:
+            logger.warning("Failed to chmod token file: %s", exc)
 
     def reload(self):
         self.token_data = self._load_token()
