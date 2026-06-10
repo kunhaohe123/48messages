@@ -350,9 +350,7 @@ class Pocket48Client:
             "token_file", DEFAULT_TOKEN_PATH
         )
         self.token_manager = TokenManager(token_file)
-        configured_token = self.config.get("pocket48", {}).get("token")
-        if configured_token and not self.token_manager.has_token():
-            self.token_manager.set_token(configured_token)
+        self._sync_configured_token_cache()
 
     def _get_session(self) -> requests.Session:
         session = getattr(self._thread_local, "session", None)
@@ -370,6 +368,26 @@ class Pocket48Client:
 
     def _pocket48_config(self) -> Dict[str, Any]:
         return self.config.get("pocket48", {})
+
+    def _configured_token(self) -> Optional[str]:
+        configured_token = self._pocket48_config().get("token")
+        if configured_token is None:
+            return None
+        configured_token = str(configured_token).strip()
+        return configured_token or None
+
+    def _sync_configured_token_cache(self):
+        configured_token = self._configured_token()
+        if not configured_token:
+            return
+
+        cached_token = self.token_manager.get_token(allow_expired=True)
+        if cached_token == configured_token:
+            return
+
+        if cached_token:
+            logger.info("Configured token differs from token cache; replacing cache")
+        self.token_manager.set_token(configured_token)
 
     def _build_app_info(self) -> str:
         app_info = self._pocket48_config().get("appInfo", {})
@@ -443,9 +461,7 @@ class Pocket48Client:
         self.notifier = ServerChanNotifier(self.config.get("notify", {}))
         self.token_manager.reload()
         self._setup_session(self._get_session())
-        configured_token = self.config.get("pocket48", {}).get("token")
-        if configured_token and not self.token_manager.has_token():
-            self.token_manager.set_token(configured_token)
+        self._sync_configured_token_cache()
 
     def _block_password_login(self, reason: str):
         self.password_login_blocked_reason = reason

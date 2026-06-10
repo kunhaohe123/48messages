@@ -132,6 +132,55 @@ class ConfigTests(unittest.TestCase):
 
         self.assertIsInstance(client.storage, SQLiteStorage)
 
+    def test_configured_token_replaces_stale_token_cache(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_dir = Path(tmpdir)
+            config_path = config_dir / "config.json"
+            token_path = config_dir / "token.json"
+            token_path.write_text(
+                json.dumps(
+                    {
+                        "access_token": "old-token",
+                        "expires_at": 4_000_000_000,
+                        "acquired_at": 1_700_000_000,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "pocket48": {"token": "new-token"},
+                        "storage": {
+                            "type": "sqlite",
+                            "database": str(config_dir / "messages.db"),
+                            "token_file": str(token_path),
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (config_dir / "members.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": 1,
+                            "ownerName": "成员A",
+                            "serverId": 10,
+                            "channelId": 20,
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            Pocket48Client(str(config_path))
+
+            token_data = json.loads(token_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(token_data["access_token"], "new-token")
+
     def test_create_mysql_storage_allows_missing_password(self):
         with mock.patch("mysql_storage.MySQLStorage") as storage_cls:
             create_storage(
