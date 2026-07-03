@@ -15,13 +15,30 @@ import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
-from pathlib import Path
 
 import requests
 
 from message_normalizer import normalize_room_messages
 from message_parser import parse_json_like, parse_member_role_from_json
 from message_storage import MessageStorage, create_storage
+from pocket48_auth import (
+    AuthenticationUnavailableError,
+    FetchMessagesError,
+    Pocket48ScraperError,
+    ServerChanNotifier,
+    TokenManager,
+)
+from pocket48_config import (
+    DEFAULT_CONFIG_PATH,
+    DEFAULT_TOKEN_PATH,
+    DEFAULT_TOKEN_REFRESH_TTL_SECONDS,
+    _format_delay,
+    _format_time_ms,
+    _member_display_name,
+    _normalize_member_config,
+    load_config,
+    resolve_project_path,
+)
 
 log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "logs")
 os.makedirs(log_dir, exist_ok=True)
@@ -75,264 +92,6 @@ def _setup_console_encoding():
 
 
 _setup_console_encoding()
-
-
-DEFAULT_CONFIG_PATH = "config/config.json"
-DEFAULT_TOKEN_PATH = "data/runtime/token.json"
-DEFAULT_MEMBERS_FILENAME = "members.json"
-DEFAULT_SINCE_DAYS_MAX_PAGES = 20
-DEFAULT_TOKEN_TTL_SECONDS = 86400
-DEFAULT_TOKEN_REFRESH_TTL_SECONDS = 6 * 60 * 60
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-
-def resolve_project_path(path_str: str) -> Path:
-    path = Path(path_str)
-    if path.is_absolute():
-        return path
-    return PROJECT_ROOT / path
-
-
-def _normalize_member_config(member: Any, index: int) -> Dict[str, Any]:
-    if not isinstance(member, dict):
-        raise ValueError(f"成员配置第 {index} 项必须是对象")
-
-    normalized = dict(member)
-
-    if normalized.get("memberId") is None and normalized.get("id") is not None:
-        normalized["memberId"] = normalized.get("id")
-
-    return normalized
-
-
-def _member_display_name(member: Dict[str, Any]) -> str:
-    return str(
-        member.get("ownerName")
-        or member.get("memberName")
-        or member.get("nickname")
-        or member.get("channelId")
-        or "-"
-    )
-
-
-def _format_time_ms(timestamp_ms: Optional[int]) -> str:
-    if timestamp_ms is None:
-        return "N/A"
-    from datetime import datetime
-
-    return datetime.fromtimestamp(timestamp_ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _format_delay(delay_seconds: float) -> str:
-    if delay_seconds == 0:
-        return "0"
-    return f"{delay_seconds:.1f}".rstrip("0").rstrip(".")
-
-
-def load_config(config_path: str) -> Dict[str, Any]:
-    path = Path(config_path)
-    if not path.exists():
-        raise FileNotFoundError(f"配置文件不存在: {config_path}")
-
-    with open(path, "r", encoding="utf-8") as file:
-        config = json.load(file)
-
-    members_path = path.parent / DEFAULT_MEMBERS_FILENAME
-    if not members_path.exists():
-        raise FileNotFoundError(f"成员配置文件不存在: {members_path}")
-    with open(members_path, "r", encoding="utf-8") as file:
-        raw_members = json.load(file)
-
-    if not isinstance(raw_members, list):
-        raise ValueError(f"成员配置必须是数组: {members_path}")
-
-    config["members"] = [
-        _normalize_member_config(member, index + 1)
-        for index, member in enumerate(raw_members)
-    ]
-
-    return config
-
-
-class ServerChanNotifier:
-    """发送微信告警，并在故障恢复前避免重复提醒。"""
-
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
-        notify_config = config or {}
-        self.sendkey = str(notify_config.get("sendkey") or "").strip()
-        self.enabled = bool(notify_config.get("enabled") and self.sendkey)
-        self.timeout = self._safe_int(notify_config.get("timeout", 10), 10)
-        self._active_events = set()
-        self._lock = threading.Lock()
-
-    @staticmethod
-    def _safe_int(value: Any, default: int) -> int:
-        try:
-            return max(int(value), 1)
-        except (TypeError, ValueError):
-            return default
-
-    def send_problem(self, event_key: str, title: str, desp: str):
-        if not self.enabled:
-            return
-
-        with self._lock:
-            if event_key in self._active_events:
-                logger.info("Skip duplicate active alert: %s", event_key)
-                return
-            self._active_events.add(event_key)
-
-        try:
-            response = requests.post(
-                f"https://sctapi.ftqq.com/{self.sendkey}.send",
-                data={"title": title, "desp": desp},
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-            logger.info("ServerChan alert sent: %s", event_key)
-        except Exception as exc:
-            logger.error("ServerChan alert failed %s: %s", event_key, exc)
-
-    def send_recovery(self, event_key: str, title: str, desp: str):
-        if not self.enabled:
-            return
-
-        with self._lock:
-            if event_key not in self._active_events:
-                return
-            self._active_events.remove(event_key)
-
-        try:
-            response = requests.post(
-                f"https://sctapi.ftqq.com/{self.sendkey}.send",
-                data={"title": title, "desp": desp},
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-            logger.info("ServerChan recovery sent: %s", event_key)
-        except Exception as exc:
-            logger.error("ServerChan recovery failed %s: %s", event_key, exc)
-
-
-class Pocket48ScraperError(RuntimeError):
-    """抓取器运行时错误基类。"""
-
-
-class AuthenticationUnavailableError(Pocket48ScraperError):
-    """当前没有可用认证信息，但服务应继续等待人工恢复。"""
-
-
-class FetchMessagesError(Pocket48ScraperError):
-    """房间消息接口请求失败。"""
-
-
-class TokenManager:
-    """负责本地缓存 token，并维护本地过期时间。"""
-
-    def __init__(self, token_file: str = DEFAULT_TOKEN_PATH):
-        self.token_file = resolve_project_path(token_file)
-        self._lock = threading.RLock()
-        self.token_data = self._load_token()
-
-    def _load_token(self) -> Dict[str, Any]:
-        path = self.token_file
-        if not path.exists():
-            return {}
-        try:
-            with open(path, "r", encoding="utf-8") as file:
-                token_data = json.load(file)
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Token cache ignored: %s", exc)
-            return {}
-        if not isinstance(token_data, dict):
-            logger.warning(
-                "Token cache ignored: expected object, got %s",
-                type(token_data).__name__,
-            )
-            return {}
-        return token_data
-
-    def _save_token(self):
-        self.token_file.parent.mkdir(parents=True, exist_ok=True)
-        temp_file = self.token_file.with_name(f".{self.token_file.name}.tmp")
-        with open(temp_file, "w", encoding="utf-8") as file:
-            json.dump(self.token_data, file, ensure_ascii=False, indent=2)
-        try:
-            os.chmod(temp_file, 0o600)
-        except OSError as exc:
-            logger.warning("Failed to chmod token temp file: %s", exc)
-        os.replace(temp_file, self.token_file)
-        try:
-            os.chmod(self.token_file, 0o600)
-        except OSError as exc:
-            logger.warning("Failed to chmod token file: %s", exc)
-
-    def reload(self):
-        with self._lock:
-            self.token_data = self._load_token()
-
-    def set_token(self, access_token: str, expires_in: int = DEFAULT_TOKEN_TTL_SECONDS):
-        with self._lock:
-            now = time.time()
-            self.token_data = {
-                "access_token": access_token,
-                "expires_at": now + expires_in,
-                "acquired_at": now,
-            }
-            self._save_token()
-        logger.info("Token saved")
-
-    def has_token(self) -> bool:
-        with self._lock:
-            return bool(self.token_data.get("access_token"))
-
-    def is_expired(self) -> bool:
-        with self._lock:
-            if not self.has_token():
-                return True
-            return time.time() >= self.token_data.get("expires_at", 0)
-
-    def get_token(self, allow_expired: bool = False) -> Optional[str]:
-        with self._lock:
-            if not self.token_data:
-                return None
-            if not allow_expired and self.is_expired():
-                logger.warning("Token expired")
-                return None
-            return self.token_data.get("access_token")
-
-    def refresh_expiry(
-        self,
-        expires_in: int = DEFAULT_TOKEN_REFRESH_TTL_SECONDS,
-        log_refresh: bool = True,
-    ) -> bool:
-        with self._lock:
-            if not self.has_token():
-                return False
-            now = time.time()
-            old_expires_at = self.token_data.get("expires_at", 0)
-            remaining_seconds = max(old_expires_at - now, 0)
-            refresh_when_below = max(int(expires_in // 3), 600)
-            if remaining_seconds > refresh_when_below:
-                return False
-
-            new_expires_at = now + expires_in
-            old_expires_at = self.token_data.get("expires_at", 0)
-            if new_expires_at <= old_expires_at:
-                return False
-            self.token_data["expires_at"] = new_expires_at
-            self._save_token()
-        if log_refresh:
-            logger.info("Token expiry refreshed")
-        return True
-
-    def clear(self):
-        with self._lock:
-            self.token_data = {}
-            path = self.token_file
-            if path.exists():
-                path.unlink()
-        logger.info("Token cleared")
 
 
 class Pocket48Client:

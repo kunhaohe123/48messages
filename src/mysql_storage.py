@@ -847,7 +847,7 @@ class MySQLStorage(MessageStorage):
                         FROM messages m
                         LEFT JOIN message_payloads mp ON mp.message_id = m.message_id
                         WHERE m.room_id = %s
-                        ORDER BY m.message_time DESC
+                        ORDER BY m.message_time_ms DESC, m.message_id DESC
                         LIMIT %s
                     """,
                         (room_id, limit),
@@ -879,7 +879,7 @@ class MySQLStorage(MessageStorage):
                         SELECT message_id, message_time_ms AS timestamp
                         FROM messages
                         WHERE room_id = %s
-                        ORDER BY message_time DESC
+                        ORDER BY message_time_ms DESC, message_id DESC
                         LIMIT 1
                     """,
                         (room_id,),
@@ -947,9 +947,7 @@ class MySQLStorage(MessageStorage):
                         ) VALUES (%s, %s, %s, 'running', 0, NOW(), NULL, NULL)
                         ON DUPLICATE KEY UPDATE
                             target_time_ms = VALUES(target_time_ms),
-                            resume_next_time = NULL,
                             status = 'running',
-                            cursor_verified = 0,
                             last_page_count = 0,
                             last_run_started_at = NOW(),
                             last_run_finished_at = NULL,
@@ -1131,7 +1129,7 @@ class MySQLStorage(MessageStorage):
                     if room_id:
                         query += " WHERE m.room_id = %s"
                         params.append(room_id)
-                    query += " ORDER BY m.message_time DESC"
+                    query += " ORDER BY m.message_time_ms DESC, m.message_id DESC"
                     if limit is not None:
                         query += " LIMIT %s"
                         params.append(limit)
@@ -1441,7 +1439,7 @@ class MySQLStorage(MessageStorage):
                         LEFT JOIN members mem ON mem.server_id = m.server_id
                         """
                         f"{where_sql}"
-                        " ORDER BY m.message_time DESC, m.message_id DESC LIMIT %s OFFSET %s"
+                        " ORDER BY m.message_time_ms DESC, m.message_id DESC LIMIT %s OFFSET %s"
                     )
                     cursor.execute(data_query, params + [limit, offset])
                     items = list(cursor.fetchall())

@@ -365,9 +365,7 @@ class SQLiteStorage(MessageStorage):
                 ) VALUES (?, ?, ?, 'running', 0, CURRENT_TIMESTAMP, NULL, NULL, CURRENT_TIMESTAMP)
                 ON CONFLICT(server_id, channel_id) DO UPDATE SET
                     target_time_ms = excluded.target_time_ms,
-                    resume_next_time = NULL,
                     status = 'running',
-                    cursor_verified = 0,
                     last_page_count = 0,
                     last_run_started_at = CURRENT_TIMESTAMP,
                     last_run_finished_at = NULL,

@@ -232,7 +232,7 @@ class TokenManagerTests(unittest.TestCase):
             token_path = Path(tmpdir) / "token.json"
             token_path.write_text("{invalid json", encoding="utf-8")
 
-            with self.assertLogs("pocket48_scraper", level="WARNING") as logs:
+            with self.assertLogs("pocket48_auth", level="WARNING") as logs:
                 manager = TokenManager(str(token_path))
 
         self.assertEqual(manager.token_data, {})
@@ -270,6 +270,136 @@ class TokenManagerTests(unittest.TestCase):
 
 
 class Pocket48ClientTests(unittest.TestCase):
+    class FakeHistoryStorage:
+        def __init__(self, checkpoint=None):
+            self.checkpoint = dict(checkpoint) if checkpoint else None
+            self.saved_messages = []
+            self.progress_updates = []
+            self.failed_finishes = []
+            self.success_finishes = []
+            self.start_calls = []
+
+        def get_history_checkpoint(self, server_id, channel_id):
+            return dict(self.checkpoint) if self.checkpoint else None
+
+        def start_history_fetch(self, server_id, channel_id, target_time_ms):
+            self.start_calls.append((server_id, channel_id, target_time_ms))
+            old = self.checkpoint or {}
+            self.checkpoint = {
+                "server_id": server_id,
+                "channel_id": channel_id,
+                "oldest_covered_message_id": old.get("oldest_covered_message_id"),
+                "oldest_covered_time_ms": old.get("oldest_covered_time_ms"),
+                "resume_next_time": old.get("resume_next_time"),
+                "target_time_ms": target_time_ms,
+                "status": "running",
+                "cursor_verified": bool(old.get("cursor_verified")),
+                "last_page_count": 0,
+            }
+
+        def update_history_checkpoint_progress(
+            self,
+            server_id,
+            channel_id,
+            oldest_covered_message_id,
+            oldest_covered_time_ms,
+            resume_next_time,
+            last_page_count,
+            cursor_verified=None,
+        ):
+            update = {
+                "server_id": server_id,
+                "channel_id": channel_id,
+                "oldest_covered_message_id": oldest_covered_message_id,
+                "oldest_covered_time_ms": oldest_covered_time_ms,
+                "resume_next_time": resume_next_time,
+                "last_page_count": last_page_count,
+                "cursor_verified": cursor_verified,
+            }
+            self.progress_updates.append(update)
+            self.checkpoint.update(
+                {
+                    "oldest_covered_message_id": oldest_covered_message_id,
+                    "oldest_covered_time_ms": oldest_covered_time_ms,
+                    "resume_next_time": resume_next_time,
+                    "last_page_count": last_page_count,
+                }
+            )
+            if cursor_verified is not None:
+                self.checkpoint["cursor_verified"] = cursor_verified
+
+        def finish_history_fetch_success(
+            self,
+            server_id,
+            channel_id,
+            target_time_ms,
+            oldest_covered_message_id,
+            oldest_covered_time_ms,
+            resume_next_time,
+            last_page_count,
+            cursor_verified=None,
+        ):
+            finish = {
+                "server_id": server_id,
+                "channel_id": channel_id,
+                "target_time_ms": target_time_ms,
+                "oldest_covered_message_id": oldest_covered_message_id,
+                "oldest_covered_time_ms": oldest_covered_time_ms,
+                "resume_next_time": resume_next_time,
+                "last_page_count": last_page_count,
+                "cursor_verified": cursor_verified,
+            }
+            self.success_finishes.append(finish)
+            self.checkpoint.update(
+                {
+                    **finish,
+                    "status": "success",
+                }
+            )
+
+        def finish_history_fetch_failed(
+            self,
+            server_id,
+            channel_id,
+            status,
+            error_message,
+            resume_next_time,
+            last_page_count,
+        ):
+            finish = {
+                "server_id": server_id,
+                "channel_id": channel_id,
+                "status": status,
+                "error_message": error_message,
+                "resume_next_time": resume_next_time,
+                "last_page_count": last_page_count,
+            }
+            self.failed_finishes.append(finish)
+            if self.checkpoint:
+                self.checkpoint.update(finish)
+
+        def save_messages(self, messages):
+            self.saved_messages.extend(messages)
+            return len(messages)
+
+    class FakeHistoryClient(Pocket48Client):
+        def __init__(self, storage, pages):
+            self.storage = storage
+            self.pages = list(pages)
+            self.requested_next_times = []
+
+        def ensure_authenticated(self):
+            return None
+
+        def _begin_fetch_round(self):
+            return None
+
+        def _get_room_messages_with_retry(self, member, limit, next_time):
+            self.requested_next_times.append(next_time)
+            if not self.pages:
+                raise AssertionError("No fake history page configured")
+            return self.pages.pop(0), 0
+
     def test_token_rejection_raises_authentication_error_without_wrapping(self):
         class FakeResponse:
             def raise_for_status(self):
@@ -391,6 +521,112 @@ class Pocket48ClientTests(unittest.TestCase):
 
         self.assertEqual(client.calls, 2)
         self.assertEqual(len(messages), 2)
+
+    def test_history_fetch_marks_incomplete_when_max_pages_reached_before_target(self):
+        storage = self.FakeHistoryStorage()
+        client = self.FakeHistoryClient(
+            storage,
+            [
+                {
+                    "messages": [
+                        make_message("m-new", room_id="20", timestamp=3000),
+                    ],
+                    "next_time": 2500,
+                    "raw_count": 1,
+                    "newest_raw_timestamp": 3000,
+                    "oldest_raw_timestamp": 3000,
+                }
+            ],
+        )
+
+        result = client.fetch_history_messages(
+            {"serverId": 10, "channelId": 20, "ownerName": "成员A"},
+            target_time_ms=1000,
+            max_pages=1,
+            page_delay=0,
+        )
+
+        self.assertFalse(result["reached_target"])
+        self.assertEqual(result["saved_count"], 1)
+        self.assertEqual(storage.failed_finishes[-1]["status"], "interrupted")
+        self.assertIn("max_pages=1", storage.failed_finishes[-1]["error_message"])
+        self.assertEqual(storage.failed_finishes[-1]["resume_next_time"], 2500)
+
+    def test_history_fetch_invalid_resume_cursor_falls_back_to_latest_page(self):
+        storage = self.FakeHistoryStorage(
+            {
+                "server_id": 10,
+                "channel_id": 20,
+                "oldest_covered_message_id": "old",
+                "oldest_covered_time_ms": 10_000,
+                "resume_next_time": 5000,
+                "target_time_ms": 1500,
+                "status": "interrupted",
+                "cursor_verified": False,
+                "last_page_count": 5,
+            }
+        )
+        client = self.FakeHistoryClient(
+            storage,
+            [
+                {
+                    "messages": [],
+                    "next_time": 4900,
+                    "raw_count": 1,
+                    "newest_raw_timestamp": 22_000_001,
+                    "oldest_raw_timestamp": 22_000_001,
+                },
+                {
+                    "messages": [
+                        make_message("m-after-fallback", room_id="20", timestamp=2000),
+                    ],
+                    "next_time": 1200,
+                    "raw_count": 1,
+                    "newest_raw_timestamp": 2000,
+                    "oldest_raw_timestamp": 1400,
+                },
+            ],
+        )
+
+        result = client.fetch_history_messages(
+            {"serverId": 10, "channelId": 20, "ownerName": "成员A"},
+            target_time_ms=1500,
+            page_delay=0,
+        )
+
+        self.assertEqual(client.requested_next_times, [5000, 0])
+        self.assertTrue(result["cursor_invalid"])
+        self.assertTrue(result["reached_target"])
+        self.assertEqual(storage.failed_finishes[0]["status"], "invalid_cursor")
+        self.assertEqual([msg["message_id"] for msg in storage.saved_messages], ["m-after-fallback"])
+
+    def test_history_fetch_keeps_messages_at_exact_target_boundary(self):
+        storage = self.FakeHistoryStorage()
+        client = self.FakeHistoryClient(
+            storage,
+            [
+                {
+                    "messages": [
+                        make_message("m-at-target", room_id="20", timestamp=1000),
+                        make_message("m-before-target", room_id="20", timestamp=999),
+                    ],
+                    "next_time": 900,
+                    "raw_count": 2,
+                    "newest_raw_timestamp": 1000,
+                    "oldest_raw_timestamp": 999,
+                }
+            ],
+        )
+
+        result = client.fetch_history_messages(
+            {"serverId": 10, "channelId": 20, "ownerName": "成员A"},
+            target_time_ms=1000,
+            page_delay=0,
+        )
+
+        self.assertTrue(result["reached_target"])
+        self.assertEqual(result["fetched_count"], 1)
+        self.assertEqual([msg["message_id"] for msg in storage.saved_messages], ["m-at-target"])
 
 
 class MessageScraperTests(unittest.TestCase):

@@ -11,7 +11,7 @@ from flask import Flask, abort, jsonify, render_template, request, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from message_storage import create_storage
-from pocket48_scraper import DEFAULT_CONFIG_PATH, load_config
+from pocket48_config import DEFAULT_CONFIG_PATH, load_config
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
