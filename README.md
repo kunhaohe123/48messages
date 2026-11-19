@@ -90,6 +90,8 @@ cp config/members.example.json config/members.json
 }
 ```
 
+成员配置可设置 `"crawlEnabled": false` 停止该房间的持续及单次抓取（包括指定 `--member`），默认启用。停用后保留成员资料及数据库历史消息，仍可查询和导出。
+
 编辑 `config/members.json`，单独维护成员列表。该文件可以被 Git 跟踪，用于随项目版本化和部署成员资料；不要在其中放入 token、抓包请求头、密码等敏感信息。
 
 ```json

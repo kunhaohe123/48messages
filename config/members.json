@@ -80,6 +80,7 @@
   {
     "id": 327567,
     "ownerName": "刘力菲",
+    "crawlEnabled": false,
     "pinyin": "LiuLiFei",
     "nickname": "flyfly、米菲、Miffy",
     "birthday": "1995/10/30",
@@ -274,6 +275,7 @@
     {
       "id": 113443142,
       "ownerName": "王思予",
+      "crawlEnabled": false,
       "pinyin": "WangSiYu",
       "nickname": "小鲨、Ayuri",
       "birthday": "2008/9/3",

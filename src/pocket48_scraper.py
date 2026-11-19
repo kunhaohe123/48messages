@@ -1311,7 +1311,9 @@ class MessageScraper:
     def _select_members(
         self, member_names: Optional[List[str]] = None
     ) -> List[Dict[str, Any]]:
-        members = self.config.get("members", [])
+        # 只停用抓取，成员资料仍同步到数据库供历史消息查询使用。
+        members = [member for member in self.config.get("members", [])
+                   if member.get("crawlEnabled", True) is not False]
         if not member_names:
             return members
 
@@ -1327,7 +1329,7 @@ class MessageScraper:
             if name not in {_member_display_name(member) for member in selected}
         ]
         for name in missing_names:
-            logger.warning("Member config not found: %s", name)
+            logger.warning("Member config not found or crawling disabled: %s", name)
         return selected
 
     def run(self, member_names: Optional[List[str]] = None):
