@@ -27,6 +27,10 @@ from pocket48_auth import (
     Pocket48ScraperError,
     ServerChanNotifier,
     TokenManager,
+    SmsLogin,
+    generate_pa,
+    device_headers,
+    configured_token_digest,
 )
 from pocket48_config import (
     DEFAULT_CONFIG_PATH,
@@ -140,6 +144,9 @@ class Pocket48Client:
         if not configured_token:
             return
 
+        if self.token_manager.token_data.get("ignored_config_token") == configured_token_digest(self.config):
+            return
+
         cached_token = self.token_manager.get_token(allow_expired=True)
         if cached_token == configured_token:
             return
@@ -153,7 +160,7 @@ class Pocket48Client:
         return json.dumps(app_info, ensure_ascii=False, separators=(",", ":"))
 
     def _setup_session(self, session: requests.Session):
-        # 这些请求头来自抓包结果，初始化后整个 Session 复用同一套指纹。
+        # 短信登录使用缓存的设备身份，兼容旧配置中的客户端指纹。
         pocket48_config = self._pocket48_config()
         headers = {
             "Accept": "*/*",
@@ -164,6 +171,11 @@ class Pocket48Client:
             "appInfo": self._build_app_info(),
             "pa": pocket48_config.get("pa", ""),
         }
+        if (self.token_manager.token_data.get("auth_method") == "sms"
+                or not pocket48_config.get("appInfo")):
+            headers.update(device_headers(self.token_manager))
+        headers.pop("pa", None)
+        session.headers.pop("pa", None)
         session.headers.update({key: value for key, value in headers.items() if value})
 
     def _get_url(self, path_key: str, default_path: str) -> str:
@@ -176,7 +188,7 @@ class Pocket48Client:
         token = self.token_manager.get_token(allow_expired=True)
         if not token:
             raise RuntimeError("未登录或缺少有效 token")
-        return {"token": token}
+        return {"token": token, "pa": generate_pa()}
 
     def _token_refresh_ttl_seconds(self) -> int:
         configured = self.config.get("storage", {}).get(
@@ -228,7 +240,7 @@ class Pocket48Client:
         self.notifier.send_problem(
             event_key="password-login-blocked",
             title="48messages 告警：需要手动更新 token",
-            desp=(f"自动密码登录已被禁用，请更新抓包 token。\n\n> 原因: {reason}"),
+            desp=(f"自动密码登录已被禁用，请运行 --login 重新短信登录。\n\n> 原因: {reason}"),
         )
 
     def _begin_fetch_round(self):
@@ -335,8 +347,8 @@ class Pocket48Client:
         mobile = pocket48_config.get("mobile")
         encrypted_password = pocket48_config.get("encryptedPassword")
 
-        if not mobile or not encrypted_password:
-            logger.error("Missing mobile or encryptedPassword, cannot login")
+        if self.token_manager.token_data.get("auth_method") == "sms" or not mobile or not encrypted_password:
+            logger.error("请运行 python src/pocket48_scraper.py -c %s --login 进行短信登录", self.config_path)
             return False
 
         # 登录接口要求的主体基本固定，真正会变化的是配置里的账号和抓包字段。
@@ -354,6 +366,7 @@ class Pocket48Client:
             response = self._get_session().post(
                 self._get_url("login_path", "/user/api/v2/login/app/app_login"),
                 json=payload,
+                headers={"pa": generate_pa()},
                 timeout=self._api_config().get("timeout", 30),
             )
             response.raise_for_status()
@@ -431,7 +444,7 @@ class Pocket48Client:
                         event_key="saved-token-rejected",
                         title="48messages 告警：saved token 已失效",
                         desp=(
-                            "服务器拒绝了当前保存的 token，需要重新抓包更新。\n\n"
+                            "服务器拒绝了当前保存的 token，请运行 --login 重新短信登录。\n\n"
                             f"> 返回信息: {message}"
                         ),
                     )
@@ -471,7 +484,7 @@ class Pocket48Client:
                     event_key="saved-token-rejected",
                     title="48messages 告警：saved token 已失效",
                     desp=(
-                        "服务器以 HTTP 401/403 拒绝了当前保存的 token，需要重新抓包更新。\n\n"
+                        "服务器以 HTTP 401/403 拒绝了当前保存的 token，请运行 --login 重新短信登录。\n\n"
                         f"> HTTP 状态码: {exc.response.status_code}"
                     ),
                 )
@@ -1759,10 +1772,26 @@ def main():
         action="store_true",
         help="Initialize or migrate database schema, then exit",
     )
+    parser.add_argument("--login", action="store_true", help="手机号短信登录并缓存 token，然后退出")
+    parser.add_argument("--switch-account", action="store_true", help="使用缓存 token 选择大小号，然后退出")
     args = parser.parse_args()
+    if args.login and args.switch_account:
+        parser.error("--login 与 --switch-account 不能同时使用")
+    if (args.login or args.switch_account) and (args.once or args.stats or args.migrate or args.export_format):
+        parser.error("登录或切换账号不能与抓取、统计、迁移或导出参数同时使用")
     _configure_logging(for_once=args.once)
 
     try:
+        if args.login or args.switch_account:
+            # 登录不依赖数据库和成员列表。
+            with open(args.config, encoding="utf-8") as file:
+                config = json.load(file)
+            auth = SmsLogin(config)
+            if args.login:
+                auth.login()
+            else:
+                auth.switch_account()
+            return
         if args.migrate:
             run_migrations(args.config)
             return

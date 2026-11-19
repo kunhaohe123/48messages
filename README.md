@@ -29,15 +29,37 @@
 
 ## 使用步骤
 
-### 1. 抓包分析（最重要）
+### 1. 短信登录
 
-详细步骤请查看 [docs/抓包分析指南.md](docs/抓包分析指南.md)
+首次配置完成后运行：
 
-主要步骤：
-1. 使用Charles/Fiddler抓包工具
-2. 在手机或模拟器上登录口袋48
-3. 进入成员房间，捕获消息列表接口
-4. 记录 `token`、`pa`、`appInfo` 和响应格式
+```bash
+python src/pocket48_scraper.py -c config/config.json --login
+```
+
+按提示输入手机号和短信验证码，随后程序列出当前账号及关联大小号（昵称、用户 ID、当前标记），
+输入序号选择抓取身份；回车保留当前账号，输入 `q` 取消且不修改原有缓存。只有一个账号时自动保存。
+配置里的 `pocket48.mobile` 可预先填写，区号 `area` 默认 `86`。
+程序自动生成 `pa`，并将固定设备身份和 token 分别保存到 `data/runtime/device.json`、`data/runtime/token.json`。
+无需填写抓包密码、`pa` 或 `appInfo`。登录不依赖数据库或成员列表。
+
+以后正常启动抓取即可复用 token。服务器拒绝 token 后，再运行同一条 `--login` 命令；
+后台服务会在认证重试时加载新缓存，不会自动发送短信。服务端有效期由口袋48决定，本地缓存不保证延长服务端有效期。
+如在另一台服务器抓取，需在服务器运行登录命令（使用相同配置及运行用户）。
+短信发送失败、风控或验证问题会明确报错，不会覆盖原有 token；支持接口返回的文本问答验证。
+
+已登录后，可直接切换大小号，无需重新接收短信：
+
+```bash
+python src/pocket48_scraper.py -c config/config.json --switch-account
+```
+
+切换成功后会用新 token 核实账号身份，再保存 token、用户 ID 和昵称。
+失败、返回 token 缺失或身份不匹配时保留原有缓存。没有可用缓存或 token 已失效时，先运行 `--login`。
+账号选择为交互操作，不在后台自动切换；重新短信登录后需再次选择账号。
+若抓取服务已经运行，请重启 `48messages-scraper`，确保立即使用所选账号。
+
+原有抓包认证配置仍兼容，相关排查见 [抓包分析指南](docs/抓包分析指南.md)。
 
 ### 2. 配置项目
 
@@ -52,21 +74,7 @@ cp config/members.example.json config/members.json
 {
   "pocket48": {
     "mobile": "手机号",
-    "encryptedPassword": "抓包得到的加密密码",
-    "deviceToken": "",
-    "token": "可选，已登录时可直接填写",
-    "userAgent": "PocketFans201807/7.1.35 (iPad; iOS 26.3.1; Scale/2.00)",
-    "appInfo": {
-      "vendor": "apple",
-      "deviceId": "你的设备ID",
-      "appVersion": "7.1.35",
-      "appBuild": "25101021",
-      "osVersion": "26.3.1",
-      "osType": "ios",
-      "deviceName": "iPad16,2",
-      "os": "ios"
-    },
-    "pa": "抓包得到的pa请求头",
+    "area": "86",
     "pSignType": "V0"
   },
   "storage": {
@@ -168,11 +176,8 @@ python src/pocket48_scraper.py -c config/config.json --migrate
 
 ### 6. 填写关键配置
 
-根据抓包结果，填充 `config/config.json` 中的以下关键字段：
+填写数据库配置后，运行 `--login` 完成短信登录即可，无需手动填写认证请求头。
 
-1. `encryptedPassword` - 登录接口中的 `loginMobile.pwd`
-2. `pa` - 请求头中的 `pa`
-3. `appInfo` - 请求头中的 `appInfo`
 成员的 `id` / `ownerName` / `channelId` / `serverId` 请填写到 `config/members.json`。
 
 ### 7. 运行程序

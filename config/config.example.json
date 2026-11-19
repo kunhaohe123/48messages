@@ -1,21 +1,9 @@
 {
   "pocket48": {
     "mobile": "手机号",
-    "encryptedPassword": "抓包得到的加密密码",
-    "deviceToken": "",
-    "token": "可选，已登录时可直接填写",
-    "userAgent": "PocketFans201807/7.1.35 (iPad; iOS 26.3.1; Scale/2.00)",
-    "appInfo": {
-      "vendor": "apple",
-      "deviceId": "你的设备ID",
-      "appVersion": "7.1.35",
-      "appBuild": "25101021",
-      "osVersion": "26.3.1",
-      "osType": "ios",
-      "deviceName": "iPad16,2",
-      "os": "ios"
-    },
-    "pa": "抓包得到的pa请求头",
+    "area": "86",
+    "encryptedPassword": "",
+    "token": "",
     "pSignType": "V0"
   },
   "api": {

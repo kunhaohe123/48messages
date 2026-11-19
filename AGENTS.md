@@ -4,7 +4,7 @@
 
 This is a **Pocket48 message scraper** - a Python tool for fetching member messages from the Pocket48 app and storing them in MySQL.
 
-**⚠️ Important**: This tool requires packet capture (抓包) to obtain authentication tokens. See `docs/抓包分析指南.md` for detailed setup instructions.
+Authentication: run `python src/pocket48_scraper.py -c config/config.json --login` for SMS login and interactive main/sub-account selection. Use `--switch-account` to select an account with the cached token without sending SMS. Switching verifies the new identity before saving; restart a running scraper to apply immediately. The client generates pa and persists device identity automatically. Legacy packet-capture configuration remains supported.
 
 ## Project Overview
 
@@ -175,7 +175,9 @@ curl -I http://127.0.0.1/
 ## Important Constraints
 
 ### Authentication Requirements
-This tool **cannot work without packet capture**:
+Preferred: use `--login` for SMS authentication; retry it when the server rejects the token. Never send SMS automatically from the monitoring service. Token lifetime is controlled by the server.
+
+Legacy packet-capture fallback:
 1. Use Charles Proxy or Fiddler to intercept Pocket48 app traffic
 2. Extract: `token`, `pa` header, `appInfo`, encrypted password
 3. Tokens expire - monitor logs for "saved token rejected" errors
@@ -199,7 +201,8 @@ This tool **cannot work without packet capture**:
 ```bash
 # Clear token cache
 rm data/runtime/token.json
-# Re-capture fresh token via Charles/Fiddler, update config.json
+# Run SMS login again
+python src/pocket48_scraper.py -c config/config.json --login
 ```
 
 **Database connection issues**:
